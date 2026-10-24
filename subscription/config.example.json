@@ -1,0 +1,19 @@
+{
+  "interface": "ens17",
+  "total_bytes": 500000000000,
+  "certificate": "/etc/qqg-sub/tls/cert.pem",
+  "private_key": "/etc/qqg-sub/tls/private.key",
+  "state_file": "/var/lib/qqg-sub/usage.json",
+  "base64_nodes": true,
+  "usage_status_node": true,
+  "devices": [
+    {
+      "token": "REPLACE_WITH_A_RANDOM_URLSAFE_TOKEN_48_CHARS_MINIMUM",
+      "files": {
+        "config.conf": "/etc/qqg-sub/clients/mac/shadowrocket.conf",
+        "clash.yaml": "/etc/qqg-sub/clients/mac/clash.yaml",
+        "nodes.txt": "/etc/qqg-sub/clients/mac/nodes.txt"
+      }
+    }
+  ]
+}

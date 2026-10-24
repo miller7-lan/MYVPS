@@ -1,0 +1,31 @@
+[Unit]
+Description=Dazzle VPS VLESS REALITY and TUIC v5
+Documentation=https://github.com/SagerNet/sing-box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sing-box
+Group=sing-box
+ExecStartPre=/etc/s-box/sing-box check -c /etc/s-box/sb.json
+ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json -D /var/lib/sing-box
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/sing-box
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target

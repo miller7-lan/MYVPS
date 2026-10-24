@@ -1,0 +1,112 @@
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "dns-v4",
+        "server": "1.1.1.1",
+        "server_port": 53
+      }
+    ],
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-sb",
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "mac",
+          "uuid": "00000001-0000-4000-8000-000000000001",
+          "flow": "xtls-rprx-vision"
+        },
+        {
+          "name": "iphone",
+          "uuid": "00000001-0000-4000-8000-000000000002",
+          "flow": "xtls-rprx-vision"
+        },
+        {
+          "name": "windows",
+          "uuid": "00000001-0000-4000-8000-000000000003",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "REPLACE_WITH_REALITY_PRIVATE_KEY",
+          "short_id": [
+            "0123456789abcdef"
+          ]
+        }
+      }
+    },
+    {
+      "type": "tuic",
+      "tag": "tuic5-sb",
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "mac",
+          "uuid": "00000002-0000-4000-8000-000000000001",
+          "password": "REPLACE_WITH_UNIQUE_TUIC_PASSWORD_1"
+        },
+        {
+          "name": "iphone",
+          "uuid": "00000002-0000-4000-8000-000000000002",
+          "password": "REPLACE_WITH_UNIQUE_TUIC_PASSWORD_2"
+        },
+        {
+          "name": "windows",
+          "uuid": "00000002-0000-4000-8000-000000000003",
+          "password": "REPLACE_WITH_UNIQUE_TUIC_PASSWORD_3"
+        }
+      ],
+      "congestion_control": "bbr",
+      "zero_rtt_handshake": false,
+      "auth_timeout": "3s",
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "min_version": "1.3",
+        "alpn": [
+          "h3"
+        ],
+        "certificate_path": "/etc/s-box/cert.pem",
+        "key_path": "/etc/s-box/private.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "default_domain_resolver": {
+      "server": "dns-v4",
+      "strategy": "ipv4_only"
+    },
+    "rules": [
+      {
+        "ip_is_private": true,
+        "action": "reject"
+      }
+    ],
+    "final": "direct"
+  }
+}

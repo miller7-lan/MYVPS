@@ -1,0 +1,27 @@
+{
+  "server_ip": "192.0.2.10",
+  "reality_sni": "www.microsoft.com",
+  "tuic_server_name": "192.0.2.10",
+  "vless_port": 443,
+  "tuic_port": 443,
+  "reality_private_key": "REPLACE_WITH_REALITY_PRIVATE_KEY",
+  "reality_public_key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+  "short_id": "REPLACE_WITH_RANDOM_HEX",
+  "users": {
+    "mac": {
+      "vless_uuid": "00000001-0000-4000-8000-000000000001",
+      "tuic_uuid": "00000002-0000-4000-8000-000000000001",
+      "tuic_password": "REPLACE_WITH_UNIQUE_TUIC_PASSWORD_1"
+    },
+    "iphone": {
+      "vless_uuid": "00000001-0000-4000-8000-000000000002",
+      "tuic_uuid": "00000002-0000-4000-8000-000000000002",
+      "tuic_password": "REPLACE_WITH_UNIQUE_TUIC_PASSWORD_2"
+    },
+    "windows": {
+      "vless_uuid": "00000001-0000-4000-8000-000000000003",
+      "tuic_uuid": "00000002-0000-4000-8000-000000000003",
+      "tuic_password": "REPLACE_WITH_UNIQUE_TUIC_PASSWORD_3"
+    }
+  }
+}

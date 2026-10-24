@@ -1,0 +1,27 @@
+# Real inputs and rendered credentials must stay local.
+/private/
+/generated/
+/secrets/
+/outputs/
+/work/
+/conversation-history/
+/.env
+/.env.*
+!.env.example
+/deployment.json
+/subscription/config.json
+**/__pycache__/
+*.py[cod]
+*.key
+*.pem
+*.p12
+*.pfx
+*.zip
+*.png
+*.jpg
+*.jpeg
+.DS_Store
+qqg-admin*
+**/nodes.txt
+**/vless.txt
+**/tuic5.txt

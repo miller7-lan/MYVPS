@@ -1,0 +1,18 @@
+name: Validate templates and subscription service
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Subscription behavior tests
+        run: python -m unittest discover -s subscription -p test_server.py -v
+      - name: Parse JSON and check shell syntax
+        run: |
+          python -c "import json,pathlib; [json.loads(p.read_text()) for p in pathlib.Path('.').rglob('*.json') if '.git' not in p.parts]"
+          sh -n server/hooks/renew-certificate.sh

@@ -1,0 +1,7 @@
+[Unit]
+Description=Renew QQG short-lived IP TLS certificate
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/opt/qqg-certbot/bin/certbot renew --quiet --cert-name qqg-ip --no-random-sleep-on-renew

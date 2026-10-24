@@ -1,0 +1,36 @@
+[Unit]
+Description=QQG private subscription and estimated traffic information
+After=network-online.target vnstat.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qqg-sub
+Group=qqg-sub
+ExecStart=/usr/bin/python3 /opt/qqg-sub/server.py --config /etc/qqg-sub/config.json
+Restart=on-failure
+RestartSec=5
+StateDirectory=qqg-sub
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/qqg-sub
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ReadWritePaths=/var/lib/qqg-sub
+LimitNOFILE=256
+TasksMax=64
+MemoryMax=128M
+StandardOutput=null
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=10
+
+[Install]
+WantedBy=multi-user.target
