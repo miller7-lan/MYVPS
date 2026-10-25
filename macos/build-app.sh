@@ -11,13 +11,8 @@ if [ ! -f "$REPO_DIR/third_party/NOTICE.md" ] || [ ! -f "$REPO_DIR/third_party/G
     printf '%s\n' 'Required third-party license notices are missing; app bundle was not built.' >&2
     exit 1
 fi
-DAZZLE_SDK="$(xcrun --sdk macosx --show-sdk-path)"
-# CLT 27's SwiftUI State macro plugin is not bundled. The included 26.5 SDK
-# retains the compatible property-wrapper API and runs normally on macOS 27.
-if [ -d /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ]; then
-    DAZZLE_SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
-fi
-swift build --package-path "$MACOS_DIR" --build-system native --sdk "$DAZZLE_SDK" -c release
+source "$MACOS_DIR/toolchain.sh"
+"$DAZZLE_SWIFT" build --package-path "$MACOS_DIR" ${DAZZLE_SWIFT_ARGS[@]+"${DAZZLE_SWIFT_ARGS[@]}"} -c release
 DAZZLE_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/dazzle-app.XXXXXX")"
 trap 'rm -rf "$DAZZLE_STAGE"' EXIT
 STAGED_APP="$DAZZLE_STAGE/DazzleVPS.app"
