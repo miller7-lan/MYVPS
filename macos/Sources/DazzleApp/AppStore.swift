@@ -13,6 +13,7 @@ import DazzleTransport
     var noticeIsWarning = false
     var artifact: ExportArtifact?
     var preview: JSONValue?
+    var sensitiveInputActive = false
     var sshHost: String
     var sshKeyPath: String
     var serverReachable = false
@@ -23,10 +24,11 @@ import DazzleTransport
     var snapshot: Snapshot? { serverSnapshot }
     var lastUpdated: Date? { serverUpdated }
     var users: [ProxyUser] { snapshot?.users ?? [] }
+    var deletedUsers: [ProxyUser] { value("deleted_users").array.compactMap(ProxyUser.init) }
     var canModify: Bool { !busy && serverSnapshot != nil && serverReachable && !serverNeedsReview && serverContext?.canModify == true }
     private let defaults: UserDefaults
     private let managementFactory: @Sendable (String, String) throws -> SSHManagementRPC
-    private let readsWithoutRevision: Set<String> = ["snapshot", "status", "doctor", "user.list", "user.resolve", "deploy.preview", "rollback.preview"]
+    private let readsWithoutRevision: Set<String> = ["snapshot", "status", "doctor", "user.list", "user.resolve", "deploy.preview", "rollback.preview", "mail.status"]
 
     init(defaults: UserDefaults = .standard,
          managementFactory: @escaping @Sendable (String, String) throws -> SSHManagementRPC = { try SSHManagementRPC(host: $0, identityFile: $1) }) {
@@ -54,7 +56,7 @@ import DazzleTransport
     }
     /// Read-only refresh of the connected controller, never a provider poll or write retry.
     func pollManagement() async {
-        guard managementConnection != nil, !busy,
+        guard managementConnection != nil, !busy, !sensitiveInputActive,
               artifact == nil, preview == nil, error == nil else { return }
         await perform("snapshot", background: true)
     }
@@ -107,7 +109,12 @@ import DazzleTransport
                 let raw = data["snapshot"]["schema_version"].int != nil ? data["snapshot"] : data
                 if raw["schema_version"].int != nil { try acceptSnapshot(raw, expectedServerID: targetID) }
                 else { try acceptSnapshot(await connection.call(RPCRequest(action: "snapshot", revision: nil, serverID: targetID)), expectedServerID: targetID) }
-                if action != "snapshot" && action != "status" && !background { notice = actionNotice(action, params: params) }
+                if action != "snapshot" && action != "status" && !background {
+                    if action.hasPrefix("mail."), action != "mail.status" {
+                        let outcome = MailFeedback.message(action: action, result: data)
+                        notice = outcome.text; noticeIsWarning = outcome.warning
+                    } else { notice = actionNotice(action, params: params) }
+                }
             }
         } catch {
             guard connectionMatches(connection) else { return }
@@ -122,7 +129,7 @@ import DazzleTransport
                     if let model = error as? ModelError, case .remote = model { /* explicit domain failure */ }
                     else { serverNeedsReview = true }
                 }
-                if !background { self.error = String(error.localizedDescription.prefix(600)) }
+                if !background { self.error = action == "mail.configure" ? "邮件设置未确认保存成功。请刷新核对；授权码不会保留或回显。" : String(error.localizedDescription.prefix(600)) }
             }
         }
     }
@@ -145,6 +152,7 @@ import DazzleTransport
         case "user.enable": "授权设置已更新，实例状态以服务确认为准"
         case "user.rotate": "新凭据已生成，请重新导出"
         case "user.revoke": "撤销请求已提交，等待服务确认"
+        case "user.delete": "删除已归档；实例停止状态等待服务确认"
         case "provider.observe": "商家核对记录已保存"
         case "settings.update": params.keys.contains(where: { ["day", "time", "timezone"].contains($0) }) ? "刷新规则已保存，下个边界生效" : "设置已保存"
         default: "已完成"

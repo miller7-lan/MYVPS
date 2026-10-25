@@ -37,3 +37,4 @@ qqg-admin*
 /build/
 
 .cache/
+*.log

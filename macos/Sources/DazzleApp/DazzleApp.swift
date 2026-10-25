@@ -107,7 +107,7 @@ struct MainView: View {
             case .dashboard:
                 DashboardPage(store: store, onUsers: { selectedUser = nil; page = .users }, onUser: { id in selectedUser = id; page = .users }, onSettings: { settings = .cycles; page = .settings })
             case .users: UsersPage(store: store, initialSelection: selectedUser)
-            case .mail: MailPage()
+            case .mail: MailPage(store: store)
             case .settings:
                 Picker("设置类别", selection: $settings) { ForEach(SettingsSection.allCases) { Text($0.rawValue).tag($0) } }
                     .pickerStyle(.segmented).frame(maxWidth: 390).padding(.bottom, 3)

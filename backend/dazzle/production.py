@@ -28,17 +28,21 @@ from .production_state import (HELPER_SOCKET, POLICY_PATH, STATE_DIR, SUBSCRIPTI
                                TLS_CERT, TLS_KEY, ProductionStore, load_policy)
 from .store import parse_time, timestamp, utcnow
 
-READS = {"doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview"}
+READS = {"doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview", "mail.status"}
 WRITES = {"user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update",
-          "user.topup", "settings.update", "provider.observe", "meter.reconcile"}
+          "user.topup", "user.delete", "settings.update", "provider.observe", "meter.reconcile",
+          "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences"}
 ALLOWED_ACTIONS = READS | WRITES
 MAX_MESSAGE = 1024 * 1024
 PARAMETERS = {
-    "snapshot": set(), "status": set(), "doctor": set(), "user.list": set(),
+    "snapshot": set(), "status": set(), "doctor": set(), "user.list": {"include_deleted"}, "mail.status": set(),
     "user.resolve": {"user_id", "name"}, "user.export": {"user_id", "format"},
     "deploy.preview": set(), "rollback.preview": {"target"},
     "user.add": {"name", "role", "quota_bytes"},
-    **{action: {"user_id"} for action in ("user.enable", "user.disable", "user.revoke", "user.rotate")},
+    **{action: {"user_id"} for action in ("user.enable", "user.disable", "user.revoke", "user.rotate", "user.delete")},
+    "mail.configure": {"host", "port", "security", "username", "sender", "admin_email", "secret"},
+    "mail.verify.send": {"user_id", "email"}, "mail.verify.confirm": {"user_id", "email", "code"},
+    "mail.test": {"user_id"}, "mail.preferences": {"enabled", "cooldown_seconds", "max_attempts"},
     "user.update": {"user_id", "name", "quota_bytes", "unlimited", "auto_restore", "threshold_percent", "email"},
     "user.topup": {"user_id", "bytes"}, "meter.reconcile": {"user_id", "evidence"},
     "settings.update": {"default_quota_bytes", "admin_reserve_bytes", "safety_margin_bytes", "day", "time", "timezone"},
@@ -109,7 +113,7 @@ def snapshot(store: ProductionStore, now=None) -> dict:
                                    "production_mutations": True, "legacy_retirement": False},
                   "legacy": {"managed": False, "ports": [443, 8443], "retirement_supported": False},
                   "accounting_scope": "New registered workers only; legacy443 and provider NIC billing excluded"})
-    for user in value["users"]:
+    for user in value["users"] + value["deleted_users"]:
         worker = store.worker(user["id"])
         state = worker["observed_state"]
         blocked = bool(user["disabled_reasons"])
@@ -123,11 +127,10 @@ def snapshot(store: ProductionStore, now=None) -> dict:
                      "disabled" if store.get_user(user["id"])["manual_disabled"] else "enabled",
                      "runtime_state": state, "runtime_verified_at": worker["verified_at"],
                      "last_error": worker["last_error"], "worker": _worker_public(worker)})
-    value["mail"] = {"configured": False, "transport": "not_enabled", "admin_email": None,
-                     "admin_email_verified": False, "queue": [], "history": [],
-                     "preferences": {"enabled": False}, "configuration": {}}
+    from .mail import snapshot_mail
+    value["mail"] = snapshot_mail(store)
     value["health"].update({"proxy": "parallel_workers", "metering": "native_payload",
-                            "mail": "not_enabled", "ssh": "fixed_control_entry"})
+                            "mail": "smtp" if value["mail"]["configured"] else "not_enabled", "ssh": "fixed_control_entry"})
     return value
 
 
@@ -174,6 +177,7 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         if set(params) & {"at", "now", "clock", "epoch", "uplink", "downlink"}:
             raise domain.DomainError("VALIDATION", "Production clocks and meter samples cannot be injected")
         sensitive = action == "user.export"
+        private_request = (action == "mail.configure" and "secret" in params) or action == "mail.verify.confirm"
         if (action in WRITES or sensitive) and request.get("server_id") != store.server_id:
             raise domain.DomainError("SERVER_ID_MISMATCH", "Refresh and confirm the registered server identity")
         if request.get("server_id") is not None and request["server_id"] != store.server_id:
@@ -205,7 +209,12 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
                     "database": "ready", "health": snapshot(store, now)["health"],
                     "capabilities": snapshot(store, now)["capabilities"]}
         elif action == "user.list":
-            data = {"users": snapshot(store, now)["users"]}
+            include = params.get("include_deleted", False)
+            if type(include) is not bool:
+                raise domain.DomainError("VALIDATION", "include_deleted must be boolean")
+            current = snapshot(store, now)
+            data = {"users": current["users"] + (current["deleted_users"] if include else []),
+                    "deleted_users": current["deleted_users"]}
         elif action == "user.resolve":
             selected = params.get("user_id", params.get("name"))
             users = [u for u in snapshot(store, now)["users"] if u["id"] == selected or u["name"] == selected]
@@ -226,7 +235,7 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         else:
             data = domain.handle_action(store, action, params, now)
         if action in WRITES:
-            if params.get("user_id") and action in {"user.enable", "user.disable", "user.revoke", "meter.reconcile"}:
+            if params.get("user_id") and action in {"user.enable", "user.disable", "user.revoke", "user.delete", "meter.reconcile"}:
                 store.conn.execute("UPDATE production_workers SET last_error=NULL WHERE user_id=?", (params["user_id"],))
             plan_jobs(store, now)
             store.set_meta("revision", store.revision + 1)
@@ -234,7 +243,7 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
                                 timestamp(now), "Parallel project only; legacy services are outside control"))
             data = {**data, "snapshot": snapshot(store, now)}
         response = _response(identifier, store.revision, data=data)
-        if action in WRITES:
+        if action in WRITES and not private_request:
             store.conn.execute("INSERT INTO requests VALUES(?,?,?,?)", (identifier, fingerprint,
                                 json.dumps(response, ensure_ascii=False), timestamp(now)))
         store.conn.commit()
@@ -245,6 +254,10 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         if store.conn.in_transaction:
             store.conn.rollback()
         return _response(identifier, store.revision, code=exc.code, message=str(exc))
+    except ValueError:
+        if store.conn.in_transaction:
+            store.conn.rollback()
+        return _response(identifier, store.revision, code="VALIDATION", message="Invalid mail or user settings")
     except Exception:
         if store.conn.in_transaction:
             store.conn.rollback()

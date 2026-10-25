@@ -153,10 +153,22 @@ public struct ExportArtifact: Sendable, Identifiable {
                   (1...65535).contains(port), port != 443 else {
                 throw ModelError.invalidResponse("真实配置包含模拟地址或旧代理入口，导出已拒绝。")
             }
+            let query = Dictionary((parts.queryItems ?? []).map { ($0.name.lowercased(), ($0.value ?? "").lowercased()) }, uniquingKeysWith: { _, new in new })
+            if parts.scheme == "vless", query["security"] != "reality" {
+                throw ModelError.invalidResponse("VLESS 配置没有启用 REALITY，导出已拒绝。")
+            }
+            let insecureFlags: Set<String> = ["insecure", "allowinsecure", "allow-insecure", "skip-cert-verify", "skip_cert_verify"]
+            for item in parts.queryItems ?? [] where insecureFlags.contains(item.name.lowercased()) {
+                if !["0", "false", "no"].contains((item.value ?? "").lowercased()) {
+                    throw ModelError.invalidResponse("节点配置关闭了证书校验，导出已拒绝。")
+                }
+            }
         }
-        for link in [nodesURL, configURL, subscriptionURL].compactMap({ $0 }) {
+        let subscriptionFile = client == .mihomo ? "config.yaml" : "nodes.txt"
+        for (optional, expectedFile) in [(nodesURL, "nodes.txt"), (configURL, "config.conf"), (subscriptionURL, subscriptionFile)] {
+            guard let link = optional else { continue }
             guard let parts = URLComponents(string: link), parts.scheme == "https", let host = parts.host,
-                  !Self.isDocumentationHost(host), parts.port == 9443 else {
+                  !Self.isDocumentationHost(host), Self.formatLink(link, filename: expectedFile) != nil else {
                 throw ModelError.invalidResponse("真实订阅地址不符合并行部署范围。")
             }
         }

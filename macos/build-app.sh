@@ -2,7 +2,11 @@
 set -euo pipefail
 MACOS_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$MACOS_DIR/.." && pwd)"
-APP_DIR="$MACOS_DIR/dist/DazzleVPS.app"
+APP_DIR="${1:-$MACOS_DIR/dist/DazzleVPS.app}"
+if [[ "$APP_DIR" != /* || "$APP_DIR" != *.app ]]; then
+    printf '%s\n' 'App output must be an absolute .app path.' >&2
+    exit 1
+fi
 if [ ! -f "$REPO_DIR/third_party/NOTICE.md" ] || [ ! -f "$REPO_DIR/third_party/GPL-3.0.txt" ]; then
     printf '%s\n' 'Required third-party license notices are missing; app bundle was not built.' >&2
     exit 1
@@ -44,6 +48,12 @@ from pathlib import Path
 import shutil,subprocess,sys
 source,destination=map(Path,sys.argv[1:])
 destination.parent.mkdir(exist_ok=True)
+if destination.is_symlink():raise SystemExit('Refusing to replace a symbolic-link app destination.')
+if destination.exists():
+    import plistlib
+    with (destination/'Contents'/'Info.plist').open('rb') as handle:existing=plistlib.load(handle)
+    if existing.get('CFBundleIdentifier')!='com.dazzle.vps.manager':
+        raise SystemExit('Refusing to replace an unrelated application.')
 backup=destination.parent/'.DazzleVPS.previous-build'
 if backup.exists():shutil.rmtree(backup)
 if destination.exists():destination.rename(backup)

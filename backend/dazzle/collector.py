@@ -213,6 +213,8 @@ def run(store, helper=None):
     collectors = Collectors(helper)
     stopped = threading.Event()
     executor = HelperExecutor(store, helper)
+    from .mail import MailExecutor
+    mail_executor = MailExecutor(store)
     def stop(*_):
         stopped.set()
     signal.signal(signal.SIGTERM, stop)
@@ -222,6 +224,7 @@ def run(store, helper=None):
             refresh_worker_status(store, helper)
             tick(store)
             executor.start()
+            mail_executor.start()
             notify("READY=1")
             while not stopped.is_set():
                 began = time.monotonic()
@@ -229,6 +232,9 @@ def run(store, helper=None):
                 collectors.drain(store)
                 tick(store)
                 executor.wake.set()
+                mail_state = "error" if mail_executor.failed.is_set() else "running"
+                if store.get_meta("mail_worker_status") != mail_state:
+                    store.set_meta("mail_worker_status", mail_state)
                 if executor.fatal.is_set():
                     raise ProductionError("HELPER_EXECUTOR_FAILED", "Registered worker executor failed")
                 results = []
@@ -245,6 +251,7 @@ def run(store, helper=None):
                 notify("WATCHDOG=1")
                 stopped.wait(max(0, 0.5 - (time.monotonic() - began)))
         finally:
+            mail_executor.close()
             executor.close()
             collectors.close()
             notify("STOPPING=1")

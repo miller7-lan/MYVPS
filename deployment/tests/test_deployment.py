@@ -40,7 +40,7 @@ class ReleaseAndApprovalTests(unittest.TestCase):
             (self.repo / name).write_text("Isolated source license fixture\n")
         for name in ("__init__.py", "production.py", "production_state.py"):
             (self.repo / "backend" / "dazzle" / name).write_text("# isolated source fixture\n")
-        for name in ("__init__.py", "helper.py", "certsync.py", "control.py", "release.py", "installer.py", "repair.py"):
+        for name in ("__init__.py", "helper.py", "certsync.py", "control.py", "release.py", "installer.py", "repair.py", "update.py"):
             (self.repo / "deployment" / name).write_text("# isolated source fixture\n")
         for template in (REPOSITORY / "systemd").iterdir():
             (self.repo / "deployment" / "systemd" / template.name).write_bytes(template.read_bytes())

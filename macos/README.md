@@ -6,7 +6,7 @@
 
 通过现有 `/usr/bin/ssh` 调用固定 `/usr/local/bin/dazzle-vps-control rpc`，请求仅通过 JSON stdin。保留 BatchMode、严格主机指纹、UpdateHostKeys=no；只引用外部密钥，不复制密钥、不自动信任新指纹，没有任意命令、安装或防火墙入口。服务器 UUID 和根策略能力必须匹配后才允许操作。
 
-前台连接后约每 8 秒刷新快照，不轮询商家 API；敏感操作、导出和预览期间暂停。写请求携带 revision；冲突只刷新，超时不自动重试。用户授权与实例状态分别展示，计量未知不会显示正常。旧 443 代理与 8443 订阅保持并行，只有根策略登记的新实例纳入管理。真实邮件尚未启用。
+前台连接后约每 8 秒刷新快照，不轮询商家 API；敏感操作、导出和预览期间暂停。写请求携带 revision；冲突只刷新，超时不自动重试。用户授权与实例状态分别展示，计量未知不会显示正常。旧 443 代理与 8443 订阅保持并行，只有根策略登记的新实例纳入管理。邮件中心支持 QQ 邮箱 465 SSL、587 STARTTLS 或自定义 SMTP，保存后先验证收件邮箱，再提交测试邮件；实际能力以服务器公告为准。
 
 敏感修改与私密导出保留系统 LocalAuthentication。导出必须来自已固定的真实服务器和已配置的新端点，拒绝文档测试地址、旧代理端口；保存通过 NSSavePanel，文件权限 0600，正文默认隐藏，剪贴板未变化时 60 秒后清除。私密内容不写入操作日志。
 
@@ -20,3 +20,12 @@ bash macos/build-app.sh
 产物为 `macos/dist/DazzleVPS.app`。App 运行时仅需 macOS，不需要本机 Python；构建脚本使用 Python 写入元数据和许可证，不打包任何后端代码。`third_party` 许可证随包。CLT 27 缺少 SwiftUI 新版宏插件，本机脚本选择已安装的 macOS 26.5 SDK，目标 macOS 14+；SwiftPM native 引擎执行 Swift Testing。
 
 构建在系统临时目录签名后发布，失败恢复上一份构建。Documents 的 File Provider 可能随后附加 FinderInfo；分发 ZIP 应排除扩展属性，并将解压副本的签名验证作为最终检查。不要将 SSH 密钥、连接配置导出或二维码加入公开仓库。
+
+
+邮箱授权码仅在发件设置的 SecureField 输入。提交后即清空字段，只通过固定 SSH 的 JSON 标准输入传给已固定的服务器，不进入本机偏好、日志或参数列表。主机、端口、加密或 SMTP 账号变更需要重新填写；管理员邮箱变更需要重新验证。保存与发送操作继续使用系统身份认证。发送记录区分排队、重试与 SMTP 已接受；SMTP 接受不代表最终收件。
+
+Clash/mihomo 导出默认使用「Clash订阅」，复制链接和二维码均指向完整的`config.yaml`，不回退到`nodes.txt`。Shadowrocket订阅和规则入口分别标明；其节点列表不能当作Clash完整配置导入。
+
+若项目位于iCloud同步的Documents，推荐直接输出到用户Applications，避免文件服务添加属性干扰签名：`bash macos/build-app.sh "$HOME/Applications/DazzleVPS.app"`。这不会移动或复制已有SSH密钥。
+
+“更多 → 删除用户”需要确认和系统认证，将用户撤销并归档。已删除用户默认隐藏，可切换“已删除”查看用量和实例停止状态；不删除流量账本、不回收预批准名额，也不能删除最后一名管理员。

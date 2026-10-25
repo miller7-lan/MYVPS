@@ -14,8 +14,8 @@ from .store import Store, parse_time, timestamp
 
 MAX_REQUEST_BYTES = 1024 * 1024
 SENSITIVE_ACTIONS = {"user.export", "mail.simulated_inbox"}
-READ_ACTIONS = {"snapshot", "status", "user.export", "mail.simulated_inbox", "deploy.preview", "rollback.preview", "history.preview", "doctor", "user.list", "user.resolve"}
-MUTATIONS = {"user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update", "user.topup",
+READ_ACTIONS = {"snapshot", "status", "user.export", "mail.status", "mail.simulated_inbox", "deploy.preview", "rollback.preview", "history.preview", "doctor", "user.list", "user.resolve"}
+MUTATIONS = {"user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update", "user.topup", "user.delete",
              "settings.update", "provider.observe", "cycle.tick", "meter.sample", "meter.failure", "meter.reconcile",
              "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences", "mail.process",
              "rollback.apply", "runtime.process", "demo.initialize"}

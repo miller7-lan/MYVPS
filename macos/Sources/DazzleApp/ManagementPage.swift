@@ -29,6 +29,10 @@ struct ManagementStatusCard: View {
             } else if let problem = store.serverRefreshError {
                 Label(problem, systemImage: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
             }
+            if store.deletedUsers.contains(where: { !UserDeletionPolicy.stopConfirmed($0) }) {
+                Label(store.deletedUsers.contains(where: { $0.raw["runtime_state"].string == "stop_failed" }) ? "已删除用户存在停止失败，旧连接可能仍活动。请到“用户 → 已删除”核对。" : "已删除用户的服务停止尚未确认。请到“用户 → 已删除”核对。", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             DisclosureGroup("管理范围") {
                 VStack(spacing: 8) {
                     ValueRow(name: "服务器身份", value: store.serverContext?.serverID ?? "未连接")

@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS users (
  email TEXT, email_verified INTEGER NOT NULL DEFAULT 0, meter_state TEXT NOT NULL DEFAULT 'unknown',
  last_sample_at TEXT, meter_epoch TEXT, last_uplink INTEGER, last_downlink INTEGER,
  trusted_sample INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
- revoked_at TEXT
+ revoked_at TEXT, deleted_at TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_live_administrator ON users(role)
  WHERE role='admin' AND revoked_at IS NULL;
@@ -155,6 +155,12 @@ class Store:
             self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
+        if "deleted_at" not in {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}:
+            try:
+                self.conn.execute("ALTER TABLE users ADD COLUMN deleted_at TEXT")
+            except sqlite3.OperationalError:
+                if "deleted_at" not in {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}:
+                    raise
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             for key, value in DEFAULT_SETTINGS.items():

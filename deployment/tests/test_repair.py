@@ -31,7 +31,7 @@ class ProgramOnlyRepairTests(unittest.TestCase):
             (self.repo / relative).mkdir(parents=True)
         for name in ("__init__.py", "production.py", "production_state.py", "collector.py", "store.py"):
             (self.repo / "backend/dazzle" / name).write_text("# old isolated source\n")
-        for name in ("__init__.py", "helper.py", "certsync.py", "control.py", "release.py", "installer.py"):
+        for name in ("__init__.py", "helper.py", "certsync.py", "control.py", "release.py", "installer.py", "update.py"):
             (self.repo / "deployment" / name).write_text("# unchanged isolated deploy source\n")
         for name in ("dazzle-vps-agent.service", "dazzle-vps-subscription.service"):
             (self.repo / "deployment/systemd" / name).write_text("# unchanged isolated unit\n")

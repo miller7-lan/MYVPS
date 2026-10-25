@@ -3,8 +3,8 @@ import Foundation
 /// A server advertises a subset of this application's fixed project-only protocol.
 /// A capability never grants shell, installation, legacy retirement or simulation APIs.
 public struct ServerContext: Sendable, Equatable {
-    public static let readActions: Set<String> = ["doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview"]
-    public static let writeActions: Set<String> = ["user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update", "user.topup", "settings.update", "provider.observe", "meter.reconcile"]
+    public static let readActions: Set<String> = ["doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview", "mail.status"]
+    public static let writeActions: Set<String> = ["user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update", "user.topup", "settings.update", "provider.observe", "meter.reconcile", "user.delete", "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences"]
     public let serverID: String
     public let allowedActions: Set<String>
     public let productionMutations: Bool

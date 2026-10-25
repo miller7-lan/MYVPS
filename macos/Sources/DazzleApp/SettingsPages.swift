@@ -177,14 +177,6 @@ struct CyclesPage: View {
     }
 }
 
-struct MailPage: View {
-    var body: some View {
-        Card {
-            EmptyState(icon: "envelope.badge.shield.half.filled", title: "真实邮件尚未启用", detail: "通知功能等待服务器完成配置；此处不会发送测试邮件。")
-        }
-    }
-}
-
 struct RecoveryPage: View {
     @Bindable var store: AppStore
     @State private var target = "last_good"
@@ -257,7 +249,7 @@ struct ConnectionPage: View {
             Card("数据与服务边界") {
                 ValueRow(name: "服务器管理", value: store.serverContext == nil ? "未连接" : "按服务器能力管理新程序")
                 ValueRow(name: "旧 443 / 8443", value: "并行保留，不参与新程序额度和撤销")
-                ValueRow(name: "真实邮件 / 商家 API", value: "尚未启用 / 等待文档核验")
+                ValueRow(name: "邮件 / 商家 API", value: (store.value("mail")["configured"].bool == true ? "邮件已配置" : "邮件待配置") + " / API 等待文档核验")
                 DisclosureGroup("隐私与存储") {
                     Text("真实快照仅保存在当前进程内；私密导出权限 0600，不进入操作日志。应用没有本地 HTTP 管理端口，连接后前台每约 8 秒只刷新快照。")
                         .font(.caption).foregroundStyle(VPSTheme.muted).padding(.top, 8)

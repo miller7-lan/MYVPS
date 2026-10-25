@@ -87,3 +87,26 @@ import DazzleModels
     #expect(throws: TransportError.self) { try SSHManagementRPC(host: "example.com;whoami", identityFile: "/not-used") }
 }
 
+
+@Test func processDrainsTwentyKilobyteStdoutWithoutPipeStall() async throws {
+    let expected = String(repeating: "x", count: 20_480)
+    let began = Date()
+    let data = try await ProcessRunner.run(executable: URL(fileURLWithPath: "/usr/bin/printf"),
+                                           arguments: ["%s", expected], timeout: 3)
+    #expect(data.count == 20_480)
+    #expect(String(data: data, encoding: .utf8) == expected)
+    #expect(Date().timeIntervalSince(began) < 3)
+}
+
+@Test func processDrainsStdoutAndStderrTogetherWithoutDisclosingStderr() async throws {
+    let data = try await ProcessRunner.run(executable: URL(fileURLWithPath: "/bin/sh"),
+        arguments: ["-c", "i=0; while [ $i -lt 2048 ]; do printf 'abcdefghij'; printf 'stderrfixture' >&2; i=$((i+1)); done"], timeout: 3)
+    #expect(data.count == 20_480)
+    #expect(!String(decoding: data, as: UTF8.self).contains("stderrfixture"))
+}
+
+@Test func processSendsInputThenClosesStdinBeforeReceivingLargeReply() async throws {
+    let expected = Data(String(repeating: "rpc-fixture", count: 2048).utf8)
+    let actual = try await ProcessRunner.run(executable: URL(fileURLWithPath: "/bin/cat"), arguments: [], input: expected, timeout: 3)
+    #expect(actual == expected)
+}

@@ -19,7 +19,7 @@ private func managedFixture(actions: [String] = ["snapshot", "user.export", "use
     #expect(context.allows("user.add"))
     #expect(!context.allows("legacy.stop"))
     #expect(!context.allows("demo.initialize"))
-    #expect(!context.allows("mail.test"))
+    #expect(context.allows("mail.test"))
     #expect(throws: ModelError.self) { try ServerContext(snapshot: value, expectedServerID: UUID().uuidString) }
     var raw = value.raw.object
     raw["mode"] = .string("simulation")
@@ -92,11 +92,11 @@ private func temporaryIdentity() throws -> URL {
         "nodes_url": .string("https://8.8.8.8:9443/fixture/nodes.txt")]
     try ExportArtifact(.object(raw)).validateProduction(serverID: fixtureServerID)
     #expect(throws: ModelError.self) { try ExportArtifact(.object(raw)).validateProduction(serverID: UUID().uuidString) }
-    raw["nodes"] = .array([.string("vless://fixture@192.0.2.10:24430#fixture")])
+    raw["nodes"] = .array([.string("vless://fixture@192.0.2.10:24430?security=reality#fixture")])
     #expect(throws: ModelError.self) { try ExportArtifact(.object(raw)).validateProduction(serverID: fixtureServerID) }
     raw["nodes"] = .array([.string("vless://fixture@8.8.8.8:443#legacy")])
     #expect(throws: ModelError.self) { try ExportArtifact(.object(raw)).validateProduction(serverID: fixtureServerID) }
-    raw["nodes"] = .array([.string("vless://fixture@8.8.8.8:24430#fixture")])
+    raw["nodes"] = .array([.string("vless://fixture@8.8.8.8:24430?security=reality#fixture")])
     raw["nodes_url"] = .string("https://8.8.8.8:8443/fixture/nodes.txt")
     #expect(throws: ModelError.self) { try ExportArtifact(.object(raw)).validateProduction(serverID: fixtureServerID) }
     raw["deployed"] = .bool(false)
@@ -144,7 +144,7 @@ private actor FixtureController {
     #expect(store.serverSnapshot?.revision == 7)
     #expect(store.canPerform("user.add"))
     #expect(!store.canPerform("demo.initialize"))
-    #expect(!store.canPerform("mail.test"))
+    #expect(store.canPerform("mail.test"))
     #expect(!store.canPerform("legacy.stop"))
     let pins = try #require(defaults.dictionary(forKey: "managementServerPins") as? [String: String])
     #expect(pins["192.0.2.20"] == fixtureServerID)
@@ -190,7 +190,8 @@ with tempfile.TemporaryDirectory(prefix="dazzle-mac-contract-") as folder:
     let context = try ServerContext(snapshot: snapshot)
     #expect(context.serverID == fixtureServerID)
     #expect(context.allows("user.update"))
-    #expect(!context.allows("mail.test"))
+    #expect(!context.allows("mail.process"))
+    #expect(!context.allows("mail.simulated_inbox"))
     #expect(snapshot.users.isEmpty)
     #expect(snapshot["legacy"]["managed"].bool == false)
     #expect(snapshot["mail"]["transport"].string == "not_enabled")
@@ -229,6 +230,10 @@ with tempfile.TemporaryDirectory(prefix="dazzle-mac-contract-") as folder:
     #expect(requests[0].action == "snapshot")
     #expect(requests[0].expected_revision == nil)
     #expect(defaults.string(forKey: "sshKeyPath") == key.path)
+    store.sensitiveInputActive = true
+    await store.pollManagement()
+    #expect(await fixture.requests().count == 1)
+    store.sensitiveInputActive = false
     await store.restoreConnection()
     #expect(await fixture.requests().count == 1)
 }
@@ -255,4 +260,26 @@ with tempfile.TemporaryDirectory(prefix="dazzle-mac-contract-") as folder:
     let before = await fixture.requests().count
     await store.perform("user.add", ["name": .string("must not send")])
     #expect(await fixture.requests().count == before)
+}
+
+@Test func twentyKilobyteLiveMailSnapshotDecodesWithoutWaitingForCredentials() throws {
+    var raw = managedFixture().object
+    raw["mail"] = .object(["configured": .bool(false), "settings_configured": .bool(true), "secret_configured": .bool(false),
+        "credential_required": .bool(true), "admin_email": .string("admin@example.test"), "admin_email_verified": .bool(false),
+        "transport": .string("smtp"), "configuration": .object(["host": .string("smtp.qq.com"), "port": .integer(465), "security": .string("ssl"), "username": .string("sender@example.test"), "sender": .string("sender@example.test")]),
+        "queue": .array([]), "history": .array([]), "preferences": .object(["enabled": .bool(true)])])
+    raw["operations"] = .array((0..<100).map { .object(["id": .string("fixture-\($0)"), "action": .string("status"), "detail": .string(String(repeating: "fixture", count: 30))]) })
+    let request = RPCRequest(action: "snapshot", revision: nil, id: "large-mail-fixture")
+    let encoded = try JSONEncoder().encode(JSONValue.object(["ok": .bool(true), "request_id": .string(request.request_id), "revision": .integer(7), "data": .object(raw)]))
+    #expect(encoded.count > 20_480)
+    let began = Date()
+    let response = try JSONDecoder().decode(RPCResponse.self, from: encoded)
+    let snapshot = try Snapshot(response.checked(for: request))
+    _ = try ServerContext(snapshot: snapshot)
+    let status = MailStatus(snapshot["mail"])
+    #expect(!status.configured)
+    #expect(!status.secretConfigured)
+    #expect(!status.canRequestVerification(address: status.adminEmail))
+    #expect(status.raw["credential_required"].bool == true)
+    #expect(Date().timeIntervalSince(began) < 1)
 }

@@ -27,6 +27,7 @@ struct UsersPage: View {
     var initialSelection: String? = nil
     @State private var selected: String?
     @State private var search = ""
+    @State private var showsDeleted = false
     @State private var addSheet = false
     @State private var editing: ProxyUser?
     @State private var showsExport = false
@@ -36,10 +37,11 @@ struct UsersPage: View {
     @State private var confirmUser: ProxyUser?
     @State private var confirmationRevision: Int64?
 
+    private var listedUsers: [ProxyUser] { showsDeleted ? store.deletedUsers : store.users }
     private var filtered: [ProxyUser] {
         let query = search.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else { return store.users }
-        return store.users.filter {
+        guard !query.isEmpty else { return listedUsers }
+        return listedUsers.filter {
             $0.name.localizedStandardContains(query) || ($0.raw["email"].string?.localizedStandardContains(query) ?? false)
         }
     }
@@ -48,17 +50,20 @@ struct UsersPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text("\(store.users.count) 位用户").font(.callout).foregroundStyle(VPSTheme.muted)
+                Picker("用户列表", selection: $showsDeleted) {
+                    Text("当前用户 \(store.users.count)").tag(false)
+                    Text("已删除 \(store.deletedUsers.count)").tag(true)
+                }.pickerStyle(.segmented).frame(width: 245)
                 Spacer()
                 Button { addSheet = true } label: { Label("添加用户", systemImage: "plus") }
                     .buttonStyle(.borderedProminent).disabled(!store.canPerform("user.add"))
             }
-            if store.users.isEmpty {
-                Card { EmptyState(icon: "person.2", title: "添加第一位用户", detail: "每位用户一份凭据，可在多台设备使用。") }
+            if listedUsers.isEmpty {
+                Card { EmptyState(icon: showsDeleted ? "archivebox" : "person.2", title: showsDeleted ? "没有已删除用户" : "添加第一位用户", detail: showsDeleted ? "删除会撤销授权并保留审计记录。" : "每位用户一份凭据，可在多台设备使用。") }
             } else {
                 HStack(alignment: .top, spacing: 18) {
                     userList.frame(width: 280)
-                    if let user { detail(user) }
+                    if let user { if showsDeleted { archivedDetail(user) } else { detail(user) } }
                     else { Card { EmptyState(icon: "magnifyingglass", title: "没有匹配的用户", detail: "试试名称或邮箱。") } }
                 }
             }
@@ -67,6 +72,7 @@ struct UsersPage: View {
         .sheet(item: $editing) { UserEditor(store: store, existing: $0) }
         .onAppear { if let initialSelection { search = ""; selected = initialSelection } }
         .onChange(of: initialSelection) { _, value in if let value { search = ""; selected = value } }
+        .onChange(of: showsDeleted) { _, _ in selected = nil; search = ""; showsTopup = false; showsExport = false }
         .onChange(of: selected) { _, _ in showsTopup = false; showsExport = false }
         .onChange(of: search) { _, _ in showsTopup = false; showsExport = false }
         .onChange(of: store.users.map(\.id)) { old, new in
@@ -76,15 +82,15 @@ struct UsersPage: View {
             } else if let added = new.first(where: { !previous.contains($0) }) { search = ""; selected = added }
         }
         .confirmationDialog(confirmationTitle, isPresented: Binding(get: { confirmAction != nil }, set: { if !$0 { confirmAction = nil } })) {
-            Button(confirmAction == "user.revoke" ? "永久撤销" : "确认轮换", role: .destructive) {
-                if let action = confirmAction, let target = confirmUser, !target.revoked, store.canPerform(action) {
+            Button(confirmAction == "user.delete" ? "删除并归档" : confirmAction == "user.revoke" ? "永久撤销" : "确认轮换", role: .destructive) {
+                if let action = confirmAction, let target = confirmUser, (action == "user.delete" || !target.revoked), store.canPerform(action) {
                     Task { await store.perform(action, ["user_id": .string(target.id)], expectedRevision: confirmationRevision) }
                 }
                 confirmAction = nil
             }
             Button("取消", role: .cancel) { confirmAction = nil }
         } message: {
-            Text(confirmAction == "user.revoke" ? "保留用量记录；恢复旧配置也不会重新授权。" : "旧凭据将失效，所有使用此用户的客户端都需要重新导入。")
+            Text(confirmAction == "user.delete" ? "撤销凭据并从当前列表移除；流量账本和审计记录继续保留，可在已删除列表查看。实例停止以服务确认为准。当前试运行资源不会自动回收，重新添加用户需重新授权服务器资源，不能直接复用此名额。" : confirmAction == "user.revoke" ? "保留用量记录；恢复旧配置也不会重新授权。" : "旧凭据将失效，所有使用此用户的客户端都需要重新导入。")
         }
     }
 
@@ -126,7 +132,6 @@ struct UsersPage: View {
     private func detail(_ user: ProxyUser) -> some View {
         let manualDisabled = user.raw["requested_authorization"].string == "disabled" || user.reasons.contains("manual_disabled")
         let protections = user.reasons.filter { $0 != "manual_disabled" && $0 != "revoked" }
-        let canAct = store.canModify && !user.revoked
         return Card {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -165,11 +170,14 @@ struct UsersPage: View {
                 Button("编辑") { editing = user }.disabled(!store.canPerform("user.update") || user.revoked)
                 Spacer(minLength: 8)
                 Menu {
-                    Button("轮换凭据…") { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.rotate" }.disabled(!store.canPerform("user.rotate"))
+                    Button("轮换凭据…") { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.rotate" }.disabled(!store.canPerform("user.rotate") || user.revoked)
                     Divider()
-                    Button("永久撤销…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.revoke" }.disabled(!store.canPerform("user.revoke"))
+                    Button("永久撤销…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.revoke" }.disabled(!store.canPerform("user.revoke") || user.revoked)
+                    Divider()
+                    Button("删除用户…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.delete" }
+                        .disabled(!store.canPerform("user.delete") || isLastAdmin(user)).help(isLastAdmin(user) ? "最后一名管理员不能删除" : "撤销授权并归档，保留流量账本")
                 } label: { Image(systemName: "ellipsis").frame(width: 20, height: 20) }
-                    .menuStyle(.borderlessButton).fixedSize().disabled(!canAct).help("更多操作")
+                    .menuStyle(.borderlessButton).fixedSize().disabled(!store.canModify).help("更多操作")
             }
             Divider()
             if !protections.isEmpty {
@@ -212,6 +220,23 @@ struct UsersPage: View {
         }
     }
 
+    private func isLastAdmin(_ user: ProxyUser) -> Bool {
+        UserDeletionPolicy.isProtectedAdministrator(user, currentUsers: store.users)
+    }
+    private func archivedDetail(_ user: ProxyUser) -> some View {
+        Card {
+            HStack { Text(user.name).font(.title2.weight(.semibold)); Spacer(); Label("已删除", systemImage: "archivebox").font(.caption).foregroundStyle(VPSTheme.muted) }
+            Text("授权删除已归档，用量与审计记录保留；实例停止以服务确认为准，归档不能恢复授权。").font(.caption).foregroundStyle(VPSTheme.muted)
+            if !UserDeletionPolicy.stopConfirmed(user) {
+                NoticeBox(icon: "exclamationmark.triangle.fill", text: user.raw["runtime_state"].string == "stop_failed" ? "服务停止失败，旧连接可能仍在活动；请核对实例。" : "服务停止尚未确认；删除归档不代表已立即断开。", tint: .orange)
+            }
+            ValueRow(name: "本周期上传", value: Display.bytes(user.raw["used_upload"].int))
+            ValueRow(name: "本周期下载", value: Display.bytes(user.raw["used_download"].int))
+            ValueRow(name: "实例状态", value: WorkerState.label(user.raw["runtime_state"].string))
+            ValueRow(name: "删除时间", value: Display.date(user.raw["deleted_at"]))
+        }
+    }
+
     private func topupPopover(_ user: ProxyUser) -> some View {
         VStack(alignment: .leading, spacing: 15) {
             Text("本期加量").font(.headline)
@@ -232,7 +257,7 @@ struct UsersPage: View {
 
     private var confirmationTitle: String {
         let name = confirmUser?.name ?? "此用户"
-        return confirmAction == "user.revoke" ? "永久撤销“\(name)”？" : "轮换“\(name)”的凭据？"
+        return confirmAction == "user.delete" ? "删除“\(name)”并归档？" : confirmAction == "user.revoke" ? "永久撤销“\(name)”？" : "轮换“\(name)”的凭据？"
     }
     private func exportButton(_ name: String, format: String, user: ProxyUser) -> some View {
         Button(name) {

@@ -56,7 +56,7 @@ def source_files(repository):
         if path.is_file() and path.suffix in {".py", ".proto"} and "__pycache__" not in path.parts:
             if path.is_symlink(): raise ValueError("Release sources cannot be symlinks")
             files["backend/" + path.relative_to(repository / "backend").as_posix()] = path.read_bytes()
-    for name in ("__init__.py", "helper.py", "certsync.py", "control.py", "release.py", "installer.py", "repair.py"):
+    for name in ("__init__.py", "helper.py", "certsync.py", "control.py", "release.py", "installer.py", "repair.py", "update.py"):
         path = repository / "deployment" / name
         if not path.is_file() or path.is_symlink(): raise ValueError("A deployment source file is missing or unsafe")
         files["deployment/" + name] = path.read_bytes()

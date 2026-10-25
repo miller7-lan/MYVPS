@@ -158,6 +158,7 @@ def _public_user(store: Store, user: dict, now: dt.datetime) -> dict:
                                       "email", "meter_state", "updated_at")},
         "status": status, "disabled_reasons": reasons, "unlimited": bool(user["unlimited"]),
         "auto_restore": bool(user["auto_restore"]), "email_verified": bool(user["email_verified"]),
+        "deleted_at": user.get("deleted_at"),
     }
 
 
@@ -209,8 +210,6 @@ def ensure_cycle(store: Store, now: dt.datetime) -> dict:
 
 
 def _mail_event(store: Store, user: dict, kind: str, now: dt.datetime, *, cycle_id: str, detail: str) -> None:
-    if store.get_meta("mode") != "simulation":
-        return
     try:
         from .mail import enqueue_notification
     except ImportError:
@@ -220,9 +219,8 @@ def _mail_event(store: Store, user: dict, kind: str, now: dt.datetime, *, cycle_
 
 
 def _notify_health(store: Store, now: dt.datetime) -> None:
-    """Simulated, verified-recipient alerts with persistent event-key deduplication."""
-    if store.get_meta("mode") != "simulation":
-        return
+    """Verified-recipient alerts with persistent event-key deduplication."""
+    production = store.get_meta("mode") == "production"
     try:
         from .mail import enqueue_notification
     except ImportError:
@@ -244,6 +242,7 @@ def _notify_health(store: Store, now: dt.datetime) -> None:
                 "ORDER BY detected_at DESC,rowid DESC LIMIT 1", (user["id"],)).fetchone()
             episode = incident["id"] if incident is not None else user["meter_epoch"] or "unavailable"
             detail = ("管理员计量异常已记录；管理员访问继续保留。" if user["role"] == "admin" else
+                      "计量异常已记录，已请求暂停该普通用户；请核对实例实际状态确认停用。" if production else
                       "计量异常已记录，已请求暂停该普通用户。本地模拟尚未部署，不能视为线上停用完成。")
             admin("metering_failure", f"{cycle['id']}:{user['id']}:metering_failure:{episode}", detail)
         if "pool_protection" in reasons:
@@ -251,11 +250,19 @@ def _notify_health(store: Store, now: dt.datetime) -> None:
     if protected:
         admin("pool_protection", f"{cycle['id']}:pool_protection",
               f"总池保护已限制 {len(protected)} 个普通用户并请求暂停；管理员不受此保护暂停。"
-              "当前仅为本地模拟，未部署到线上。")
+              "请核对实例实际运行状态。" if production else
+              f"总池保护已限制 {len(protected)} 个普通用户并请求暂停；管理员不受此保护暂停。当前仅为本地模拟，未部署到线上。")
     for task in store.conn.execute("SELECT id FROM runtime_queue WHERE status='failed' AND verb='stop'"):
         admin("runtime_pause_failed", "runtime_pause_failed:" + task["id"],
+              "新用户实例暂停任务失败，尚未确认停止，请核对实际运行状态。" if production else
               "本地模拟的暂停任务失败，不能确认用户已停用。请检查任务状态；未执行任何线上服务操作。",
               scope="runtime-task:" + task["id"])
+    if production:
+        for task in store.conn.execute("SELECT p.id,w.user_id FROM production_jobs p JOIN production_workers w ON w.worker_id=p.worker_id WHERE p.status='failed' AND p.action IN ('stage','stop','revoke')"):
+            if disabled_reasons(store.get_user(task["user_id"]), now):
+                admin("runtime_pause_failed", "runtime_pause_failed:" + task["id"],
+                      "新用户实例的暂停任务失败，尚未确认停止；请检查服务器实例状态。旧代理不在本次任务范围内。",
+                      scope="runtime-task:" + task["id"])
     quota_end = parse_time(cycle["end_at"])
     if dt.timedelta(0) < quota_end - now <= dt.timedelta(hours=24):
         admin("quota_cycle_upcoming", f"{cycle['id']}:quota_cycle_upcoming",
@@ -305,7 +312,8 @@ def _quota(store: Store, user_id: str, now: dt.datetime) -> None:
                         detail="The current administrator-scheduled allowance is approaching its threshold.")
         if "quota_exceeded" in reasons:
             _mail_event(store, user, "quota_exceeded", now, cycle_id=cycle["id"],
-                        detail="The current administrator-scheduled allowance has been used. A pause has been requested in the local simulation; no production suspension has been performed.")
+                        detail="当前管理员规则下的个人载荷额度已用尽，已请求暂停该用户；以实例实际状态确认停用。" if store.get_meta("mode") == "production" else
+                        "The current administrator-scheduled allowance has been used. A pause has been requested in the local simulation; no production suspension has been performed.")
     _set_reasons(store, user_id, reasons, now)
 
 
@@ -353,7 +361,7 @@ def _cycle_tick(store: Store, now: dt.datetime) -> dict:
             from .mail import enqueue_notification
         except ImportError:
             enqueue_notification = None
-        if enqueue_notification is not None and store.get_meta("mode") == "simulation":
+        if enqueue_notification is not None:
             enqueue_notification(store, event_key="quota-cycle-closed:" + cycle["id"], user_id=None,
                                  kind="cycle_summary", subject="Dazzle'VPS quota cycle summary",
                                  body=f"Recorded upload: {report['used_upload']} bytes; download: {report['used_download']} bytes. "
@@ -394,7 +402,9 @@ def _cycle_tick(store: Store, now: dt.datetime) -> dict:
 def snapshot(store: Store, now: dt.datetime | None = None) -> dict:
     now = parse_time(now) if now is not None else store.now
     current = ensure_cycle(store, now)
-    users = [_public_user(store, dict(row), now) for row in store.conn.execute("SELECT * FROM users ORDER BY created_at,id")]
+    all_users = [_public_user(store, dict(row), now) for row in store.conn.execute("SELECT * FROM users ORDER BY created_at,id")]
+    users = [user for user in all_users if not user["deleted_at"]]
+    deleted_users = [user for user in all_users if user["deleted_at"]]
     provider = store.get_meta("provider")
     freshness = provider_freshness(provider, now)
     members_allocated = sum((user["quota_bytes"] or 0) + user["topup_bytes"] for user in users
@@ -422,11 +432,11 @@ def snapshot(store: Store, now: dt.datetime | None = None) -> dict:
         warnings.append("Administrator reserve and safety margin are not configured.")
     return {"schema_version": 1, "mode": store.get_meta("mode"), "revision": store.revision,
             "settings": settings, "quota_cycle": current, "provider": provider,
-            "provider_freshness": freshness, "users": users,
+            "provider_freshness": freshness, "users": users, "deleted_users": deleted_users,
             "totals": {"users_count": sum(user["status"] != "revoked" for user in users),
                        "members_allocated_bytes": members_allocated,
-                       "used_upload": sum(user["used_upload"] for user in users),
-                       "used_download": sum(user["used_download"] for user in users),
+                       "used_upload": sum(user["used_upload"] for user in all_users),
+                       "used_download": sum(user["used_download"] for user in all_users),
                        "overallocated": bool(overallocated),
                        "protection_state": "unverified" if not provider.get("unit_verified") else "stale" if freshness["state"] != "fresh" else (
                            "active" if any("pool_protection" in user["disabled_reasons"] for user in users) else "ready")},
@@ -556,7 +566,7 @@ def _provider_observe(store: Store, params: dict, now: dt.datetime) -> dict:
             from .mail import enqueue_notification
         except ImportError:
             enqueue_notification = None
-        if enqueue_notification is not None and store.get_meta("mode") == "simulation":
+        if enqueue_notification is not None:
             cycle = ensure_cycle(store, now)
             warning = not provider.get("unit_verified") or result.get("event_kind") != "reset_confirmed"
             kind = "provider_warning" if warning else "provider_cycle_confirmed"
@@ -591,10 +601,21 @@ def handle_action(store: Store, action: str, params: dict, now: dt.datetime) -> 
     user_id = None
     if action == "user.add":
         user_id = _add_user(store, params, now)["id"]
-    elif action in {"user.enable", "user.disable", "user.revoke", "user.rotate", "user.update", "user.topup"}:
-        user = _user(store, params)
+    elif action in {"user.enable", "user.disable", "user.revoke", "user.rotate", "user.update", "user.topup", "user.delete"}:
+        user = _user(store, params, live=action != "user.delete")
         user_id = user["id"]
-        if action == "user.enable":
+        if action == "user.delete":
+            if user["role"] == "admin" and not store.conn.execute(
+                    "SELECT 1 FROM users WHERE role='admin' AND id!=? AND revoked_at IS NULL AND deleted_at IS NULL", (user_id,)).fetchone():
+                raise DomainError("LAST_ADMIN", "The last administrator cannot be deleted")
+            store.conn.execute("UPDATE users SET deleted_at=COALESCE(deleted_at,?),revoked_at=COALESCE(revoked_at,?),manual_disabled=1,email_verified=0,updated_at=? WHERE id=?",
+                               (timestamp(now), timestamp(now), timestamp(now), user_id))
+            store.conn.execute("DELETE FROM credentials WHERE user_id=?", (user_id,))
+            store.conn.execute("UPDATE mail_outbox SET status='cancelled',completed_at=?,error_code='RECIPIENT_NO_LONGER_AUTHORIZED',lease_owner=NULL,lease_until=NULL WHERE user_id=? AND status IN ('queued','retry')",
+                               (timestamp(now), user_id))
+            store.conn.execute("DELETE FROM mail_private_payload WHERE outbox_id IN (SELECT id FROM mail_outbox WHERE user_id=? AND status='cancelled')", (user_id,))
+            _queue(store, user_id, "stop", "permanently_deleted", now)
+        elif action == "user.enable":
             store.conn.execute("UPDATE users SET manual_disabled=0,updated_at=? WHERE id=?", (timestamp(now), user_id))
             if user["role"] != "admin" and not user["trusted_sample"]:
                 _set_reasons(store, user_id, set(json.loads(user["reasons_json"])) | {"metering_failure"}, now)
@@ -650,7 +671,7 @@ def handle_action(store: Store, action: str, params: dict, now: dt.datetime) -> 
             changes["updated_at"] = timestamp(now)
             store.conn.execute("UPDATE users SET " + ",".join(key + "=?" for key in changes) + " WHERE id=?",
                                (*changes.values(), user_id))
-        if action != "user.revoke":
+        if action not in {"user.revoke", "user.delete"}:
             _quota(store, user_id, now)
         _sync_runtime(store, now, user_id)
     elif action == "settings.update":
@@ -709,7 +730,7 @@ def handle_action(store: Store, action: str, params: dict, now: dt.datetime) -> 
             store.conn.execute("UPDATE users SET meter_state='trusted' WHERE id=?", (user_id,))
             store.conn.execute("UPDATE metering_incidents SET resolved_at=?,evidence=?,operator=?,resolution=? "
                                "WHERE user_id=? AND resolved_at IS NULL",
-                               (timestamp(now), evidence, "local_simulation_administrator", "acknowledged_unallocated_gap",
+                               (timestamp(now), evidence, "ssh_authenticated_administrator" if store.get_meta("mode") == "production" else "local_simulation_administrator", "acknowledged_unallocated_gap",
                                 user_id))
         _sync_runtime(store, now, user_id)
     elif action.startswith("mail."):

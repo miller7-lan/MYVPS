@@ -176,7 +176,7 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(denied["error"]["code"], "VALIDATION")
 
     def test_production_allowlist_rejects_simulation_clock_and_mail_actions(self):
-        forbidden = ("demo.initialize", "mail.simulated_inbox", "mail.process", "mail.configure", "meter.sample",
+        forbidden = ("demo.initialize", "mail.simulated_inbox", "mail.process", "meter.sample",
                      "meter.failure", "cycle.tick", "runtime.process", "rollback.apply")
         for action in forbidden:
             self.assertFalse(self.call(action, ok=False)["ok"])
