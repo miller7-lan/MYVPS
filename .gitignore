@@ -18,6 +18,7 @@
 *.pfx
 *.zip
 *.png
+!macos/Assets/AppIcon.png
 *.jpg
 *.jpeg
 .DS_Store
