@@ -1,71 +1,50 @@
 # Dazzle'VPS · MYVPS
 
-个人 VPS 双协议配置与维护资料：**VLESS REALITY（常用）**、**TUIC v5（迅速）**，配套 Shadowrocket、Clash Verge Rev / Mihomo 分流配置和私密流量订阅服务。
+服务器上的个人 VPS 双协议服务：**VLESS REALITY（常用）**、**TUIC v5（迅速）**，配套独立用户凭据、个人载荷额度和私密 HTTPS 订阅。
 
-本仓库为公开的脱敏模板，**不能直接作为节点订阅使用**。真实 SSH 私钥、证书私钥、节点 UUID / 密码、REALITY 密钥和订阅令牌仅保存在部署环境及本地私密文件中。
+**使用入口：[V3.1 服务器使用指南](docs/V3.1-服务器使用.md)。** Mac App 只连接服务器管理，不再提供本地演示环境，也不需要安装模拟 CLI。
 
-## 内容
+## 当前状态
 
-| 路径 | 内容 |
+2026-10-25，新程序已经并行部署到 VPS。新管理后台与验收用户实例已运行，真实 VLESS／TUIC、订阅及额度流程仍在验收中；**尚未作出最终验收通过的结论**。
+
+- 原 TCP／UDP **443** 代理与 TCP **8443** 订阅继续保留。新程序的额度、停用和撤销不会操作这些旧入口。
+- 新管理员入口为 TCP／UDP **24430**，新普通用户入口为 TCP／UDP **24431**；新私密订阅使用 TCP **9443**。
+- 管理复用现有 SSH 和固定控制入口，没有新建公网管理 API；计量 API 仅监听服务器回环地址。
+- 普通用户默认每周期 **100GB 个人代理载荷额度**；管理员不设个人额度上限，仍受商家实际套餐约束。验收账号可能临时采用较小额度，以服务器显示为准。
+- 用户额度默认每月 **24 日 16:19，Asia/Shanghai** 刷新。这是管理员规则，与商家实际计费、赠送、续费和重置分别记录。
+- 商家实时余额与自动接口尚未核实，真实邮件未启用。历史面板展示值不能当作当前可用流量。
+
+旧入口只会在用户另行明确验收并确认后考虑撤回；本程序没有旧服务退役命令。
+
+## 资料入口
+
+| 路径 | 用途 |
 | --- | --- |
-| [客户端导入](docs/客户端导入.md) | Shadowrocket、Clash Verge Rev 与 Mihomo 客户端导入 |
-| [服务器配置与维护](docs/服务器配置与维护.md) | 参数生成、服务、证书续期、防火墙及稳定性设置 |
-| [订阅服务](docs/订阅服务.md) | 私密 HTTPS 订阅与共享剩余流量估算 |
-| [client/](client/) | 保留原分流规则的脱敏示例 |
-| [server/](server/) | sing-box 服务端示例、systemd、基础防护和证书部署钩子 |
-| [scripts/](scripts/) | 本地生成配置及合并基本规则；不联网、不上传凭据 |
-| [subscription/](subscription/) | Python 标准库实现的私密 HTTPS 订阅服务及测试 |
+| [服务器使用指南](docs/V3.1-服务器使用.md) | 连接管理 App、用户授权、导出订阅和流量口径 |
+| [部署与恢复工具](deployment/README.md) | 新服务的发布、审批绑定、安装与项目范围恢复 |
+| [并行部署合同](contracts/parallel-production.md) | 新旧服务边界、受限 Helper、计量和验收约束 |
+| [客户端导入参考](docs/客户端导入.md) | Shadowrocket、Clash Verge Rev／Mihomo 导入参考；真实新配置以服务器导出为准 |
+| [既有服务器维护参考](docs/服务器配置与维护.md) | 原服务的配置、证书与网络维护资料，不是新程序的重装步骤 |
+| [原订阅服务参考](docs/订阅服务.md) | 原 8443 服务及共享网卡流量估算，与新个人载荷账本不同 |
+| [backend/](backend/) 与 [deployment/](deployment/) | 服务器后台、计量、订阅及受限部署源码 |
+| [macos/](macos/) | 服务器管理界面源码 |
 
-## 已采用的方案
+`client/`、`server/`、`subscription/` 和配置生成脚本保留为维护与开发参考。历史本地使用、模拟邮件和第一阶段调查文档仅作审计记录，不再作为安装或使用入口。
 
-- Ubuntu 24.04、官方 sing-box **1.14.4**；VLESS 使用 TCP 443，TUIC 使用 UDP 443。
-- 节点名：`Dazzle'VPS-VLESS（常用）`、`Dazzle'VPS-TUIC5（迅速）`；默认常用，手动切换备用。
-- 国内、局域网、Tailscale 直连；Shadowrocket 保留 616 条基本规则并新增 5 条优先直连规则。Mihomo 转换 615 条基本规则并新增 5 条直连规则。
-- 两种协议共用同一服务器与出口 IP，不构成独立服务器备份，也不保证任意 AI 账号或功能长期可用。
-- TUIC 保持证书校验、关闭 0-RTT；BBR 与“迅速”命名不代表所有网络下必然更快。
-- 独立低权限服务、密钥登录、最小入站端口、异常恢复、日志限额、应急交换空间、安全更新不自动重启。
-- 证书自动续期并热重载代理；私密订阅服务另用 TCP 8443，刷新后显示共享流量估算。
+## 配置与数据
 
-## 生成自己的配置
+本仓库提供脱敏源码与模板，**不能直接作为可用订阅导入**。真实服务器地址、SSH 私钥、证书私钥、节点凭据、REALITY 私钥和完整订阅令牌不得提交到公开仓库。
 
-先阅读 [服务器配置与维护](docs/服务器配置与维护.md)，准备自己的服务器地址、随机节点凭据和 REALITY 密钥。公开示例中的占位符和示例凭据必须替换。
+新服务器的配置与证书位于 `/etc/dazzle-vps`，账本位于 `/var/lib/dazzle-vps`，运行版本位于 `/opt/dazzle-vps`。这些生产资料不由本地演示数据替代，也不能通过重新生成示例配置覆盖。
 
-```sh
-mkdir -p private
-chmod 700 private
-cp deployment.example.json private/deployment.json
-# 编辑 private/deployment.json，填写自己的新凭据；不要提交此目录。
-python3 scripts/render.py --input private/deployment.json --out generated
-```
-
-`generated/` 和 `private/` 已被 Git 忽略。生成器拒绝覆盖已有文件；输出含凭据，权限为 0600，目录为 0700。真实生成结果不能提交到仓库。
-
-合并你自己的 Shadowrocket 基本规则：
-
-```sh
-python3 scripts/merge_base.py \
-  --input private/deployment.json \
-  --base private/default.conf \
-  --out private/merged \
-  --native-routing-only
-```
-
-合并结果也包含真实凭据，因此输出到被忽略的 `private/merged`。`--native-routing-only` 的规则文件不含 `[Proxy]`，Shadowrocket 必须先导入私密节点订阅。Mihomo 配置仍包含节点。
-
-## 本地检查
-
-```sh
-python3 -m unittest discover -s subscription -p test_server.py -v
-sh -n server/hooks/renew-certificate.sh
-```
-
-GitHub Actions 执行订阅服务测试、JSON 解析和证书钩子语法检查。模板本身不启动生产服务，测试通过不等于 AI 账号、晚高峰线路或商家余额已验证。
+两个协议共用同一服务器与出口 IP。它们不构成独立服务器备份，也不能保证所有 AI 账号、服务功能或晚高峰线路长期可用。TUIC 保持证书校验并关闭 0-RTT；“迅速”只是节点名称。
 
 ## 参考与来源
 
 - [sing-box 官方项目](https://github.com/SagerNet/sing-box) 与 [官方配置文档](https://sing-box.sagernet.org/)
-- [sing-box-yg 参考仓库](https://github.com/yonggekkk/sing-box-yg)：仅参考配置方式，没有运行其整套一键脚本。
+- [sing-box-yg 参考仓库](https://github.com/yonggekkk/sing-box-yg)：仅参考配置方式，未运行整套一键脚本。
 - [Mihomo 官方文档](https://wiki.metacubex.one/)
 - [Clash Verge Rev 官方项目](https://github.com/clash-verge-rev/clash-verge-rev)
 
-本仓库不分发上述项目的二进制或第三方源码。
+上游协议来源和许可见 [third_party/NOTICE.md](third_party/NOTICE.md)。

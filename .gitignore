@@ -25,3 +25,15 @@ qqg-admin*
 **/nodes.txt
 **/vless.txt
 **/tuic5.txt
+
+# V3.1 local runtime, app bundle, caches and ledgers
+.venv/
+**/.build/
+/dist/
+**/*.app/
+**/*.sqlite3*
+**/*.egg-info/
+**/.swiftpm/
+/build/
+
+.cache/

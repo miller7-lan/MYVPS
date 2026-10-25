@@ -1,0 +1,38 @@
+[Unit]
+Description=Dazzle fail-closed member proxy %i
+BindsTo=dazzle-vps-agent.service
+After=network-online.target dazzle-vps-agent.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+Slice=system.slice
+User=dazzle-proxy
+Group=dazzle-proxy
+SupplementaryGroups=dazzle-vps
+LoadCredential=worker.json:/etc/dazzle-vps/workers/%i.json
+ExecStartPre=/opt/dazzle-vps/core/sing-box check -c %d/worker.json
+ExecStart=/opt/dazzle-vps/core/sing-box run -c %d/worker.json -D /var/lib/dazzle-vps-workers/%i
+StateDirectory=dazzle-vps-workers/%i
+StateDirectoryMode=0700
+Restart=no
+TimeoutStopSec=5
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dazzle-vps-workers/%i
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=128M
+TasksMax=64
+LimitNOFILE=8192
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=30

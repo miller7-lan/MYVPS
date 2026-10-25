@@ -1,0 +1,26 @@
+[Unit]
+Description=Validate and copy TLS material to the new Dazzle namespace only
+
+[Service]
+Environment=PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m deployment.certsync
+TimeoutStartSec=30
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/dazzle-vps/tls
+ReadOnlyPaths=/etc/s-box/cert.pem /etc/s-box/private.key
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=64M
+TasksMax=16

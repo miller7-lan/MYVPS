@@ -1,0 +1,18 @@
+// Wire-compatible observation-only projection of SagerNet/sing-box v1.14.4
+// daemon/started_service.proto. Upstream copyright SagerNet, GPL-3.0-or-later.
+// Field numbers/types are retained. No control RPC is included.
+syntax = "proto3";
+package daemon;
+message SubscribeStatusRequest { int64 interval = 1; }
+message Status {
+  uint64 memory = 1;
+  int32 goroutines = 2;
+  int32 connectionsIn = 3;
+  int32 connectionsOut = 4;
+  bool trafficAvailable = 5;
+  int64 uplink = 6;
+  int64 downlink = 7;
+  int64 uplinkTotal = 8;
+  int64 downlinkTotal = 9;
+}
+message StartedAt { int64 startedAt = 1; }

@@ -1,0 +1,35 @@
+[Unit]
+Description=Dazzle new token-only HTTPS subscription endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+Type=exec
+User=dazzle-agent
+Group=dazzle-agent
+SupplementaryGroups=dazzle-vps
+ExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m dazzle.production --policy /etc/dazzle-vps/policy.json --state-dir /var/lib/dazzle-vps subscription
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/dazzle-vps
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=96M
+TasksMax=64
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target

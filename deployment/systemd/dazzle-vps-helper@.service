@@ -1,0 +1,30 @@
+[Unit]
+Description=Dazzle single registered worker operation
+PartOf=dazzle-vps-helper.socket
+After=dazzle-vps-helper.socket
+
+[Service]
+Environment=PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+Type=exec
+User=root
+Group=root
+ExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m deployment.helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=null
+RuntimeMaxSec=40
+TimeoutStopSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/dazzle-vps
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=96M
+TasksMax=32

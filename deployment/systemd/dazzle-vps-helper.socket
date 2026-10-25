@@ -1,0 +1,15 @@
+[Unit]
+Description=Dazzle project-only root worker control socket
+
+[Socket]
+ListenStream=/run/dazzle-vps/helper.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=dazzle-vps
+DirectoryMode=0755
+Accept=yes
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

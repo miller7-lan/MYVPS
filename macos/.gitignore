@@ -1,0 +1,6 @@
+.build/
+dist/
+.DS_Store
+.build-test.log
+.build-app.log
+.ui-*
