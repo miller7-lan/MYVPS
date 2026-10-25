@@ -22,8 +22,9 @@ from .store import parse_time, utcnow
 
 class Collectors:
     """Reader threads never access SQLite. Queue overflow is an explicit fault."""
-    def __init__(self, helper=None, api_factory=NativeAPI, max_events=256):
+    def __init__(self, helper=None, api_factory=NativeAPI, max_events=256, verify_helper=True):
         self.helper = helper or HelperClient()
+        self.verify_helper = verify_helper
         self.api_factory = api_factory
         self.events = queue.Queue(maxsize=max_events)
         self.overflow = threading.Event()
@@ -44,7 +45,7 @@ class Collectors:
                 for sample in api.stream():
                     if stop.is_set():
                         return
-                    if first:
+                    if first and self.verify_helper:
                         # Status after the first frame fences a restart between
                         # helper activation and opening the native API stream.
                         result = self.helper.call({"version": 1, "request_id": str(uuid.uuid4()),
@@ -55,7 +56,7 @@ class Collectors:
                                 result.get("worker_state") != worker["observed_state"]):
                             self._emit((key, "identity_changed", None))
                             return
-                        first = False
+                    first = False
                     self._emit((key, "sample", sample))
             except Exception:
                 self._emit((key, "unavailable", None))
@@ -201,7 +202,12 @@ class HelperExecutor:
 
 
 @contextmanager
-def single_agent(store):
+def single_agent(store, acquired_lock=None):
+    if acquired_lock is not None:
+        # Ownership was already acquired on this same inode by the standby.
+        os.fstat(acquired_lock)
+        yield
+        return
     descriptor = os.open(store.state_dir / "agent.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -210,22 +216,24 @@ def single_agent(store):
         os.close(descriptor)
 
 
-def run(store, helper=None):
+def run(store, helper=None, *, acquired_lock=None, collectors=None, stop=None, takeover=False, recovery=False):
     helper = helper or HelperClient()
-    collectors = Collectors(helper)
-    stopped = threading.Event()
+    collectors = collectors or Collectors(helper)
+    stopped = stop or threading.Event()
     executor = HelperExecutor(store, helper)
     from .mail import MailExecutor
     mail_executor = MailExecutor(store)
     from .portal_rpc import PortalExecutor
     portal_executor = PortalExecutor(store)
-    def stop(*_):
+    def request_stop(*_):
         stopped.set()
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-    with single_agent(store):
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
+    with single_agent(store, acquired_lock):
         try:
-            refresh_worker_status(store, helper)
+            if not takeover:
+                refresh_worker_status(store, helper)
             tick(store)
             executor.start()
             mail_executor.start()
@@ -233,7 +241,9 @@ def run(store, helper=None):
                 portal_executor.start()
             except Exception:
                 portal_executor.failed.set()  # Portal failure must not stop existing proxy workers.
-            notify("READY=1")
+            recovery = recovery or bool(store.get_meta("agent_recovery_only", False))
+            notify("READY=1\nSTATUS=writer-recovery; reconciliation-required=true" if recovery else "READY=1\nSTATUS=writer-ready; trusted-samples=true")
+            last_recovery = recovery
             while not stopped.is_set():
                 began = time.monotonic()
                 collectors.synchronize(store)
@@ -259,6 +269,10 @@ def run(store, helper=None):
                                      for row in store.conn.execute("SELECT * FROM production_workers WHERE user_id IS NOT NULL"))
                     if endangered:
                         raise ProductionError("PAUSE_UNCONFIRMED", "A member pause could not be confirmed")
+                current_recovery = bool(store.get_meta("agent_recovery_only", False))
+                if current_recovery != last_recovery:
+                    notify("STATUS=writer-recovery; reconciliation-required=true" if current_recovery else "STATUS=writer-ready; recovery-holds-cleared=true")
+                    last_recovery = current_recovery
                 notify("WATCHDOG=1")
                 stopped.wait(max(0, 0.5 - (time.monotonic() - began)))
         finally:

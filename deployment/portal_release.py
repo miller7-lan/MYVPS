@@ -20,9 +20,9 @@ from .release import LICENSE_FILES, PROTOBUF_VERSION, source_files, validate_whe
 
 REQUIRED_PACKAGES = frozenset({"protobuf", "starlette", "uvicorn", "anyio", "click", "h11", "idna", "typing-extensions", "qrcode"})
 OPTIONAL_PACKAGES = frozenset({"sniffio"})
-PORTAL_TOOLS = ("portal_release.py", "portal_upgrade.py")
+PORTAL_TOOLS = ("portal_release.py", "portal_upgrade.py", "handoff.py", "coordinator.py")
 STATIC_FILES = ("index.html", "app.css", "app.js")
-TEMPLATES = ("subscription.service", "agent.conf", "certsync.conf", "tmpfiles.conf")
+TEMPLATES = ("subscription.service", "agent.conf", "certsync.conf", "tmpfiles.conf", "writer@.service", "meter-guard@.service", "guarded-member.service", "managed-certsync.conf")
 
 
 def normalized(name):
@@ -97,7 +97,7 @@ def portal_sources(repository):
         path = repository / "deployment/portal-systemd" / name
         if not path.is_file() or path.is_symlink(): raise ValueError("A portal service template is unavailable")
         result["deployment/portal-systemd/" + name] = path.read_bytes()
-    for name in ("portal.py", "portal_rpc.py", "registration.py"):
+    for name in ("portal.py", "portal_rpc.py", "registration.py", "meter_guard.py"):
         if "backend/dazzle/" + name not in result: raise ValueError("Portal implementation is incomplete")
     return result
 

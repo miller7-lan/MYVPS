@@ -1,0 +1,34 @@
+[Unit]
+Description=Dazzle independent verified meter guard for member %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+Type=notify
+NotifyAccess=main
+User=dazzle-agent
+Group=dazzle-agent
+SupplementaryGroups=dazzle-vps
+ExecStart=/opt/dazzle-vps/releases/@RELEASE_ID@/venv/bin/python -I -m dazzle.meter_guard --policy /etc/dazzle-vps/policy.json --state-dir /var/lib/dazzle-vps --worker-id %i
+Restart=no
+WatchdogSec=5
+TimeoutStartSec=10
+TimeoutStopSec=5
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/var/lib/dazzle-vps
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=64M
+TasksMax=16
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=20

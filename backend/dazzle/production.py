@@ -135,7 +135,8 @@ def snapshot(store: ProductionStore, now=None) -> dict:
     value["registration"] = registration_snapshot(store, now)
     value["health"].update({"proxy": "parallel_workers", "metering": "native_payload",
                             "mail": "smtp" if value["mail"]["configured"] else "not_enabled", "ssh": "fixed_control_entry",
-                            "portal": store.get_meta("portal_worker_status", "not_observed")})
+                            "portal": store.get_meta("portal_worker_status", "not_observed"),
+                            "controller_mode": "recovery_only" if store.get_meta("agent_recovery_only", False) else "normal"})
     return value
 
 
@@ -248,6 +249,21 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         else:
             data = domain.handle_action(store, action, params, now)
         if action in WRITES:
+            if action == "meter.reconcile" and params.get("user_id") in store.get_meta("agent_recovery_holds", {}):
+                worker = store.worker(params["user_id"])
+                if (worker["observed_state"] != "staged" or worker["origin_pending"] or
+                        worker["observed_generation"] != worker["root_ack_generation"]):
+                    raise domain.DomainError("VALIDATION", "Cold recovery requires a freshly sampled API-only worker")
+                holds = store.get_meta("agent_recovery_holds", {})
+                holds.pop(params["user_id"], None)
+                store.set_meta("agent_recovery_holds", holds)
+                store.set_meta("agent_recovery_only", bool(holds))
+            if params.get("user_id") and action in {"user.revoke", "user.delete"}:
+                holds = store.get_meta("agent_recovery_holds", {})
+                if params["user_id"] in holds:
+                    holds.pop(params["user_id"])
+                    store.set_meta("agent_recovery_holds", holds)
+                    store.set_meta("agent_recovery_only", bool(holds))
             if params.get("user_id") and action in {"user.rotate", "user.revoke", "user.delete"}:
                 from .registration import sync_user
                 sync_user(store, params["user_id"], now)
@@ -376,6 +392,8 @@ def plan_jobs(store: ProductionStore, now) -> None:
             action = "activate" if worker["observed_state"] == "staged" and user["trusted_sample"] else None
         else:
             action = "stage" if worker["observed_state"] == "running" else None
+        if action == "activate" and worker["role"] == "member" and worker["user_id"] in store.get_meta("agent_recovery_holds", {}):
+            continue  # Explicit cold recovery never grants member proxy access.
         if not action:
             continue
         generation = worker["root_ack_generation"] + 1
@@ -755,10 +773,24 @@ def main(argv=None):
     parser.add_argument("--policy", default=POLICY_PATH)
     parser.add_argument("--state-dir", default=STATE_DIR)
     parser.add_argument("command", choices=["initialize", "rpc", "agent", "subscription"])
+    parser.add_argument("--standby", action="store_true")
+    parser.add_argument("--allow-no-core-recovery", action="store_true")
     args = parser.parse_args(argv)
     request = None
     try:
         policy = load_policy(args.policy)
+        if args.allow_no_core_recovery and not args.standby:
+            raise ValueError("Cold recovery is an explicit standby option")
+        if args.standby and args.command != "agent":
+            raise ValueError("Standby is only available for the agent")
+        if args.command == "agent" and args.standby:
+            from .standby import run_standby
+            import signal
+            stopped = threading.Event()
+            signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+            signal.signal(signal.SIGINT, lambda *_: stopped.set())
+            run_standby(args.state_dir, policy, stop=stopped, allow_no_core_recovery=args.allow_no_core_recovery)
+            return 0
         if args.command == "initialize":
             if os.geteuid() != 0:
                 raise ValueError("Initialization is installer-only")

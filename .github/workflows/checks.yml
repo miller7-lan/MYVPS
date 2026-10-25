@@ -3,6 +3,16 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  systemd-handoff:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated service dependency and accounting handoff
+        run: sudo --preserve-env=GITHUB_ACTIONS python3 deployment/tests/systemd_handoff/integration.py
+      - name: Coordinator rehearsal with real systemd, unit templates and root helper
+        run: sudo --preserve-env=GITHUB_ACTIONS python3 deployment/tests/systemd_handoff/rehearsal.py
+
   validate:
     runs-on: ubuntu-latest
     steps:

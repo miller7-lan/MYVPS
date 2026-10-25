@@ -131,6 +131,78 @@ class HelperTests(unittest.TestCase):
         self.assertTrue(stage["managed_origin_zero"])
         self.assertFalse(self.call("status", 0)["managed_origin_zero"])
 
+    def test_v2_guard_proof_precedes_start_contains_no_secrets_and_keeps_original_deadline(self):
+        self.policy.update(version=2, portal_uid=1002)
+        self.write(self.etc/'policy.json', self.policy)
+        self.layout.guard_proofs.mkdir(mode=0o750)
+        path = self.layout.guard_proofs/(self.worker_id+'.json')
+        prepared = []
+        original = self.runner.run
+        def run(arguments, **kwargs):
+            if arguments[1] == 'restart':
+                proof = json.loads(path.read_text()); prepared.append(proof)
+                self.assertEqual(proof['phase'], 'prepared'); self.assertIsNone(proof['process_id'])
+                self.assertEqual(proof['config_sha256'], hashlib.sha256((self.etc/'workers'/(self.worker_id+'.json')).read_bytes()).hexdigest())
+            return original(arguments, **kwargs)
+        self.runner.run = run
+        with patch('deployment.helper.machine_boot_id', return_value=str(uuid.uuid4())):
+            result = self.stage()
+        proof = json.loads(path.read_text())
+        self.assertEqual(proof['phase'], 'complete'); self.assertEqual(proof['process_id'], result['process_id'])
+        self.assertEqual(proof['prepared_monotonic_ns'], prepared[0]['prepared_monotonic_ns'])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        for secret in (*self.credentials.values(), 'a'*43): self.assertNotIn(secret, path.read_text())
+
+    def test_v2_missing_guard_proof_directory_refuses_restart(self):
+        self.policy.update(version=2, portal_uid=1002)
+        self.write(self.etc/'policy.json', self.policy)
+        self.provision()
+        response = self.helper.dispatch(self.request('stage', 2), peer_uid=1001)
+        self.assertFalse(response['ok'])
+        self.assertFalse(any(call[1] == 'restart' for call in self.runner.calls))
+
+    def test_v2_owned_stop_removes_bootstrap_proof(self):
+        self.policy.update(version=2, portal_uid=1002)
+        self.write(self.etc/'policy.json', self.policy)
+        self.layout.guard_proofs.mkdir(mode=0o750)
+        with patch('deployment.helper.machine_boot_id', return_value=str(uuid.uuid4())):
+            self.stage()
+        self.assertTrue((self.layout.guard_proofs/(self.worker_id+'.json')).exists())
+        self.call('stop', 3)
+        self.assertFalse((self.layout.guard_proofs/(self.worker_id+'.json')).exists())
+
+    def test_v1_without_guard_directory_keeps_the_unguarded_behaviour(self):
+        result = self.stage()
+        self.assertTrue(result["managed_origin_zero"])
+        self.assertFalse(self.layout.guard_proofs.exists())
+
+    def test_v1_after_live_handoff_writes_and_removes_member_guard_proofs(self):
+        # Phase A keeps policy v1 but installs per-member guards; managed restarts
+        # must keep proving their transition or the guard would stop the member.
+        self.layout.guard_proofs.mkdir(mode=0o750)
+        path = self.layout.guard_proofs/(self.worker_id+'.json')
+        seen = []
+        original = self.runner.run
+        def run(arguments, **kwargs):
+            if arguments[1] == 'restart':
+                seen.append(json.loads(path.read_text())['phase'])
+            return original(arguments, **kwargs)
+        self.runner.run = run
+        with patch('deployment.helper.machine_boot_id', return_value=str(uuid.uuid4())):
+            result = self.stage()
+        proof = json.loads(path.read_text())
+        self.assertEqual(seen, ['prepared'])
+        self.assertEqual((proof['phase'], proof['mode'], proof['process_id']), ('complete', 'staged', result['process_id']))
+        self.call('stop', 3)
+        self.assertFalse(path.exists())
+
+    def test_guard_proofs_are_never_written_for_the_independent_administrator(self):
+        self.layout.guard_proofs.mkdir(mode=0o750)
+        self.worker_id = self.admin_id
+        with patch('deployment.helper.machine_boot_id', return_value=str(uuid.uuid4())):
+            self.stage()
+        self.assertEqual(list(self.layout.guard_proofs.iterdir()), [])
+
     def test_activate_contains_exact_single_user_and_approved_ports(self):
         self.stage()
         result = self.call("activate", 3)

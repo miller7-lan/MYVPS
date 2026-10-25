@@ -57,6 +57,8 @@ class Layout:
     def tls_certificate(self): return self.etc / "tls" / "cert.pem"
     @property
     def tls_key(self): return self.etc / "tls" / "key.pem"
+    @property
+    def guard_proofs(self): return self.etc / "guard-proofs"
 
 
 class Runner:
@@ -64,6 +66,13 @@ class Runner:
         return subprocess.run(arguments, input=input, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=timeout, check=False,
                               env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"})
+
+
+def machine_boot_id():
+    try:
+        return str(uuid.UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+    except (OSError, ValueError):
+        raise HelperError('GUARD_PROOF', 'The kernel boot identity is unavailable') from None
 
 
 def canonical_uuid(value):
@@ -296,10 +305,11 @@ class Helper:
         target = self.layout.workers / (worker_id + ".json")
         checked_path(target, self.layout.trusted_uid, missing=True)
         descriptor, temporary = tempfile.mkstemp(prefix=".validate-", suffix=".json", dir=self.layout.workers)
+        encoded = json.dumps(config, separators=(",", ":")).encode()
         try:
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as stream:
-                stream.write(json.dumps(config, separators=(",", ":")).encode()); stream.flush(); os.fsync(stream.fileno())
+                stream.write(encoded); stream.flush(); os.fsync(stream.fileno())
             self._run([str(self.layout.core), "check", "-c", temporary])
             os.replace(temporary, target)
             parent = os.open(self.layout.workers, os.O_RDONLY | os.O_DIRECTORY)
@@ -307,6 +317,38 @@ class Helper:
             finally: os.close(parent)
         finally:
             if os.path.exists(temporary): os.unlink(temporary)
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _guard_proof(self, policy, worker_id, generation, mode, config_sha256, *, previous=None, process_id=None):
+        directory = checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True)
+        if previous is None:
+            prepared = time.monotonic_ns()
+        else:
+            prepared = previous['prepared_monotonic_ns']
+        proof = {'version': 1, 'server_id': policy['server_id'], 'worker_id': worker_id, 'generation': generation,
+                 'mode': mode, 'phase': 'prepared' if process_id is None else 'complete',
+                 'config_sha256': config_sha256, 'process_id': process_id, 'boot_id': machine_boot_id(),
+                 'prepared_monotonic_ns': prepared, 'observed_monotonic_ns': time.monotonic_ns()}
+        atomic_bytes(self.layout.guard_proofs / (worker_id + '.json'),
+                     json.dumps(proof, sort_keys=True, separators=(',', ':')).encode() + b'\n',
+                     mode=0o640, trusted_uid=self.layout.trusted_uid, gid=directory.st_gid)
+        return proof
+
+    def _guarded(self, policy, worker):
+        # v2 members always need root proofs. Under v1 the reviewed live handoff
+        # creates the proof directory together with the per-member guards.
+        if worker['role'] != 'member':
+            return False
+        if policy['version'] == 2:
+            checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True)
+            return True
+        return checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True, missing=True) is not None
+
+    def _remove_guard_proof(self, worker_id):
+        path = self.layout.guard_proofs / (worker_id + '.json')
+        if path.exists() or path.is_symlink():
+            checked_path(path, self.layout.trusted_uid)
+            path.unlink()
 
     def _data(self, policy, worker_id, worker, record, actual, *, origin=False):
         if record.get("tombstoned"):
@@ -400,19 +442,29 @@ class Helper:
                             record.update(private_key=private_key, public_key=public_key)
                         record.update(credentials=credentials, mode="provisioned")
                     elif action in {"stage", "activate"}:
+                        guarded = self._guarded(policy, worker)
                         if action == "activate":
                             checked_path(self.layout.tls_certificate, self.layout.trusted_uid)
                             checked_path(self.layout.tls_key, self.layout.trusted_uid)
                         config = self._config(worker_id, worker, credentials, record["private_key"], active=action == "activate")
-                        self._install_config(worker_id, config, policy)
+                        config_sha256 = self._install_config(worker_id, config, policy)
+                        proof = None
+                        if guarded:
+                            proof = self._guard_proof(policy, worker_id, generation,
+                                                      'running' if action == 'activate' else 'staged', config_sha256)
                         record.update(credentials=credentials, mode="running" if action == "activate" else "staged")
                         atomic_json(self.layout.registry, registry, self.layout.trusted_uid)
                         self._run(["/usr/bin/systemctl", "restart", self._unit(worker_id, worker)])
                         actual = self._actual(worker_id, worker)
                         if not actual["active"]: raise HelperError("START_FAILED", "Owned worker did not become active")
+                        if proof is not None:
+                            self._guard_proof(policy, worker_id, generation, proof['mode'], config_sha256,
+                                              previous=proof, process_id=actual['pid'])
                         origin = True
                     else:
                         actual = self._stop(worker_id, worker)
+                        if worker['role'] == 'member' and (policy['version'] == 2 or self.layout.guard_proofs.exists()):
+                            self._remove_guard_proof(worker_id)
                         record["mode"] = "revoked" if record.get("tombstoned") else "stopped"
                     record["operation"]["status"] = "complete"
                     data = self._data(policy, worker_id, worker, record, actual, origin=origin)

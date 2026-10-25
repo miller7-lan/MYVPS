@@ -93,7 +93,7 @@ class ResourcePolicyTests(unittest.TestCase):
 class PortalPackageTests(unittest.TestCase):
     def setUp(self):
         test_deployment.ReleaseAndApprovalTests.setUp(self)
-        for name in ("portal.py", "registration.py", "portal_rpc.py"):
+        for name in ("portal.py", "registration.py", "portal_rpc.py", "meter_guard.py"):
             (self.repo / "backend/dazzle" / name).write_text("# isolated portal fixture\n")
         static = self.repo / "backend/dazzle/portal_static"; static.mkdir()
         for name in portal_release.STATIC_FILES: (static / name).write_text("isolated static fixture\n")
