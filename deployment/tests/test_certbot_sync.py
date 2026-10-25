@@ -112,14 +112,15 @@ class ManagedCertificateSourceTests(unittest.TestCase):
                 finally: path.chmod(before)
 
     def test_wrong_source_symlink_owner_is_rejected(self):
-        real_lstat = os.lstat
-        def altered(path, *args, **kwargs):
-            value = real_lstat(path, *args, **kwargs)
-            if Path(path) == self.key:
+        real_lstat = Path.lstat
+        def altered(path):
+            value = real_lstat(path)
+            if path == self.key:
                 fields = list(value); fields[4] = os.getuid() + 1
                 return os.stat_result(fields)
             return value
-        with patch("deployment.certsync.os.lstat", side_effect=altered):
+        # certsync reads the live entries with Path.lstat, which reaches os.lstat only from Python 3.14.
+        with patch.object(Path, "lstat", altered):
             with self.assertRaises(HelperError): self.sync()
         self.assert_no_pair()
 

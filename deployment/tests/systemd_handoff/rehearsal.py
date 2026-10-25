@@ -16,6 +16,7 @@ from pathlib import Path
 import pwd
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -346,6 +347,11 @@ def main():
     if not any(field.startswith("shared:") for field in root[6:root.index("-")]):
         # Docker starts with private propagation; systemd then cannot deliver LoadCredential=.
         raise SystemExit("The root mount must be shared (in Docker run `mount --make-rshared /` first).")
+    bin_dir = os.lstat("/usr/local/bin")
+    if not stat.S_ISDIR(bin_dir.st_mode) or bin_dir.st_uid != 0 or bin_dir.st_mode & 0o022:
+        # The coordinator refuses to swap a root launcher where others can write, as on the target.
+        raise SystemExit("/usr/local/bin must be a root-owned directory that others cannot write "
+                         "(GitHub-hosted runners ship it as 0777; run `chmod 0755 /usr/local/bin` first).")
     present = [path for path in OWNED_PATHS if Path(path).exists() or Path(path).is_symlink()]
     for name in ACCOUNTS:
         try:

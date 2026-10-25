@@ -37,7 +37,7 @@ import time
 import uuid
 
 from .handoff import OLD_POLICY_SNAPSHOT, OLD_WRITER, guard_name, render_existing_member, render_old_writer_fallback
-from .helper import Runner, atomic_bytes, canonical_uuid, checked_path, validate_policy
+from .helper import HelperError, Runner, atomic_bytes, canonical_uuid, checked_path, validate_policy
 from .installer import canonical, sha256
 
 OPERATION = "live_writer_handoff"
@@ -410,6 +410,14 @@ class Host:
         checked_path(path, self.layout.trusted_uid)
         return Path(path).read_bytes()
 
+    def require_replaceable(self, path):
+        """An atomic swap needs a root-only file in a root-only directory, as the installer left them."""
+        try:
+            checked_path(Path(path).parent, self.layout.trusted_uid, directory=True)
+            checked_path(path, self.layout.trusted_uid)
+        except HelperError as exc:
+            raise ValueError("Management entry cannot be swapped safely: " + exc.message) from None
+
     def exists(self, path):
         return Path(path).exists() or Path(path).is_symlink()
 
@@ -678,6 +686,7 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
     member_source = source(template_path, "deployment/systemd/dazzle-proxy@.service")
     if host.read(layout.control) != LAUNCHER:
         raise ValueError("Management entry differs from the reviewed fixed launcher")
+    host.require_replaceable(layout.control)  # The hold swaps it in place during apply.
     registry_bytes = host.read(layout.registry)
 
     files = {}
@@ -1376,6 +1385,8 @@ class Coordinator:
                         else:
                             self.journal["status"] = "taken_over_writer_review_required"
                 except Exception as exc:
+                    if not isinstance(exc, Abort):
+                        self.journal["unexpected_error"] = f"{type(exc).__name__}: {exc}"
                     if not self.old_stopped:
                         self.revert(str(exc) if isinstance(exc, Abort) else "Unexpected failure before the old writer was stopped")
                     elif self.journal["status"] == "started":

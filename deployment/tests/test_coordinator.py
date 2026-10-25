@@ -47,6 +47,7 @@ class World:
         self.files, self.dirs, self.calls, self.events = {}, set(), [], []
         self.reader_broken = False
         self.control_busy_until = 0.0
+        self.unsafe_paths = set()  # Paths whose file or directory is writable by non-root users.
         self.server_id, self.admin, self.member = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         self.policy = {"version": 1, "server_id": self.server_id, "server_endpoint": "8.8.8.8", "agent_uid": 991,
                        "core_sha256": CORE_SHA256, "workers": {self.admin: {"role": "admin", "public_port": 24430, "api_port": 34430},
@@ -330,6 +331,10 @@ class FakeHost:
         if str(path) not in self.world.files:
             raise ValueError("missing trusted file")
         return self.world.files[str(path)]
+
+    def require_replaceable(self, path):
+        if str(path) in self.world.unsafe_paths:
+            raise ValueError("Management entry cannot be swapped safely: Unsafe project file ownership or mode")
 
     def exists(self, path): return str(path) in self.world.files or str(path) in self.world.dirs
 
@@ -633,6 +638,27 @@ class CoordinatorTests(unittest.TestCase):
         result = self.run_coordinator(plan)
         self.assertIn("Reviewed facts changed", result["abort_reason"])
         self.assertEqual(self.world.calls, [])
+
+    def test_management_entry_in_a_directory_others_can_write_blocks_the_preview(self):
+        # GitHub-hosted runners ship /usr/local/bin as 0777; the hold must not swap a root launcher there.
+        self.world.unsafe_paths.add(str(self.layout.control))
+        with self.assertRaisesRegex(ValueError, "cannot be swapped safely"):
+            self.plan()
+        self.assertEqual(self.world.calls, [])
+
+    def test_unexpected_error_is_recorded_with_its_type_and_the_entry_is_untouched(self):
+        original = self.host.write
+        def write(path, payload, *, mode, gid=None):
+            if str(path) == str(self.layout.control):
+                raise PermissionError("simulated refusal")
+            return original(path, payload, mode=mode, gid=gid)
+        self.host.write = write
+        result = self.run_coordinator()
+        self.assertEqual(result["status"], "aborted_no_core_or_writer_changed", result)
+        self.assertEqual(result["unexpected_error"], "PermissionError: simulated refusal")
+        self.assertEqual(self.world.files["/usr/local/bin/dazzle-vps-control"], LAUNCHER)
+        self.assertEqual(self.world.calls, [])
+        self.assert_original_layout()
 
     def test_in_flight_management_call_that_never_ends_aborts_and_restores_entry(self):
         self.world.control_busy_until = self.world.time + 999
