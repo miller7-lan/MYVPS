@@ -28,6 +28,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Native app tests
-        run: bash macos/test-app.sh
+        run: |
+          set +e
+          bash macos/test-app.sh 2>&1 | tee "$RUNNER_TEMP/dazzle-native-tests.log"
+          test_status=${PIPESTATUS[0]}
+          if [ "$test_status" -ne 0 ]; then
+            DAZZLE_CI_LOG="$RUNNER_TEMP/dazzle-native-tests.log" python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          def escape(value):
+              return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          for arguments in (['xcrun', 'swift', '--version'], ['xcrun', '--sdk', 'macosx', '--show-sdk-path']):
+              result = subprocess.run(arguments, capture_output=True, text=True, timeout=15)
+              print('::notice title=Selected Apple toolchain::' + escape(result.stdout.strip()))
+          lines = pathlib.Path(os.environ['DAZZLE_CI_LOG']).read_text(errors='replace').splitlines()
+          failures = [line for line in lines if re.search(r'error:|fatal error|failed', line, re.I)]
+          for line in (failures[:12] or lines[-8:]):
+              print('::error title=Native app test failure::' + escape(line[:1500]))
+          PY
+          fi
+          exit "$test_status"
       - name: Build server management app
         run: bash macos/build-app.sh
