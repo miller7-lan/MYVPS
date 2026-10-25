@@ -105,6 +105,8 @@ struct MailPage: View {
         switch kind {
         case "verification": "邮箱验证"
         case "test": "测试邮件"
+        case "portal_welcome": "注册确认"
+        case "portal_activated": "开通及订阅"
         case "quota_threshold": "额度提醒"
         case "quota_exceeded": "额度用尽"
         case "cycle_summary": "周期总结"

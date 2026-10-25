@@ -35,6 +35,7 @@ qqg-admin*
 **/*.egg-info/
 **/.swiftpm/
 /build/
+/backend/build/
 
 .cache/
 *.log

@@ -49,8 +49,12 @@ CREATE TABLE IF NOT EXISTS production_retired_origins (
 
 def validate_policy(policy: dict) -> dict:
     required = {"version", "server_id", "server_endpoint", "agent_uid", "core_sha256", "workers"}
-    if not isinstance(policy, dict) or set(policy) != required or type(policy.get("version")) is not int or policy["version"] != 1:
+    if not isinstance(policy, dict) or type(policy.get("version")) is not int or policy["version"] not in {1, 2}:
         raise ValueError("Invalid root policy version")
+    if policy["version"] == 2:
+        required.add("portal_uid")
+    if set(policy) != required:
+        raise ValueError("Invalid root policy fields")
     try:
         if str(uuid.UUID(policy["server_id"])) != policy["server_id"]:
             raise ValueError()
@@ -61,6 +65,8 @@ def validate_policy(policy: dict) -> dict:
         raise ValueError("Root policy identity or endpoint is invalid") from None
     if policy.get("core_sha256") != CORE_SHA256 or type(policy.get("agent_uid")) is not int or policy["agent_uid"] <= 0:
         raise ValueError("Root policy core or agent identity is invalid")
+    if policy["version"] == 2 and (type(policy.get("portal_uid")) is not int or policy["portal_uid"] <= 0 or policy["portal_uid"] == policy["agent_uid"]):
+        raise ValueError("A distinct installed portal UID is required")
     workers = policy.get("workers")
     if not isinstance(workers, dict) or not workers:
         raise ValueError("No approved workers")
@@ -68,9 +74,16 @@ def validate_policy(policy: dict) -> dict:
     for identifier, worker in workers.items():
         if str(uuid.UUID(identifier)) != identifier or not isinstance(worker, dict):
             raise ValueError("Invalid registered worker")
-        if set(worker) != {"role", "public_port", "api_port"} or worker.get("role") not in {"admin", "member"} or worker["role"] in roles:
+        if set(worker) != {"role", "public_port", "api_port"} or worker.get("role") not in {"admin", "member"}:
             raise ValueError("Invalid registered role")
-        expected = {"admin": (24430, 34430), "member": (24431, 34431)}[worker["role"]]
+        if worker["role"] in roles and (policy["version"] == 1 or worker["role"] == "admin"):
+            raise ValueError("Duplicate registered role")
+        public, api = worker["public_port"], worker["api_port"]
+        expected = (24430, 34430) if worker["role"] == "admin" else (24431, 34431)
+        if policy["version"] == 2 and worker["role"] == "member":
+            if type(public) is not int or not 24431 <= public <= 24436:
+                raise ValueError("Worker is outside the approved resource pool")
+            expected = (public, public + 10000)
         if (worker["public_port"], worker["api_port"]) != expected:
             raise ValueError("Worker is outside the approved pilot ports")
         roles.add(worker["role"])
@@ -131,6 +144,8 @@ class ProductionStore(Store):
             self.conn.execute("ALTER TABLE production_workers ADD COLUMN root_ack_generation INTEGER NOT NULL DEFAULT 0")
         self.conn.execute("BEGIN IMMEDIATE")
         try:
+            from . import registration
+            registration.ensure_schema(self)
             self.set_meta("server_id", policy["server_id"])
             for identifier, worker in policy["workers"].items():
                 old = self.conn.execute("SELECT role,public_port,api_port FROM production_workers WHERE worker_id=?", (identifier,)).fetchone()

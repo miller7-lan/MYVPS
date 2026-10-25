@@ -322,6 +322,12 @@ def _guard(store: Store, now: dt.datetime) -> None:
         user = dict(row)
         if store.get_meta("mode") == "production":
             worker = store.worker(user["id"])
+            # A newly approved slot has no proxy listener before its first
+            # staged origin. Do not invent a metering gap before any process
+            # could carry traffic; staged/running workers retain the 5s guard.
+            if (worker["observed_state"] in {"unprovisioned", "provisioned"} and worker["process_id"] in (None, 0) and
+                    not user["meter_epoch"] and not user["last_sample_at"]):
+                continue
             if (worker["origin_pending"] and worker["verified_at"] and
                     0 <= (now - parse_time(worker["verified_at"])).total_seconds() <= 5):
                 continue

@@ -28,14 +28,16 @@ from .production_state import (HELPER_SOCKET, POLICY_PATH, STATE_DIR, SUBSCRIPTI
                                TLS_CERT, TLS_KEY, ProductionStore, load_policy)
 from .store import parse_time, timestamp, utcnow
 
-READS = {"doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview", "mail.status"}
+READS = {"doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview", "mail.status", "registration.list"}
 WRITES = {"user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update",
           "user.topup", "user.delete", "settings.update", "provider.observe", "meter.reconcile",
-          "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences"}
+          "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences",
+          "registration.approve", "registration.reject"}
 ALLOWED_ACTIONS = READS | WRITES
 MAX_MESSAGE = 1024 * 1024
 PARAMETERS = {
     "snapshot": set(), "status": set(), "doctor": set(), "user.list": {"include_deleted"}, "mail.status": set(),
+    "registration.list": set(), "registration.approve": {"account_id", "quota_bytes"}, "registration.reject": {"account_id", "reason"},
     "user.resolve": {"user_id", "name"}, "user.export": {"user_id", "format"},
     "deploy.preview": set(), "rollback.preview": {"target"},
     "user.add": {"name", "role", "quota_bytes"},
@@ -45,7 +47,7 @@ PARAMETERS = {
     "mail.test": {"user_id"}, "mail.preferences": {"enabled", "cooldown_seconds", "max_attempts"},
     "user.update": {"user_id", "name", "quota_bytes", "unlimited", "auto_restore", "threshold_percent", "email"},
     "user.topup": {"user_id", "bytes"}, "meter.reconcile": {"user_id", "evidence"},
-    "settings.update": {"default_quota_bytes", "admin_reserve_bytes", "safety_margin_bytes", "day", "time", "timezone"},
+    "settings.update": {"default_quota_bytes", "admin_reserve_bytes", "safety_margin_bytes", "day", "time", "timezone", "registration_enabled"},
     "provider.observe": {"instance_id", "remaining_display", "total_display", "expected_reset_date", "evidence", "kind",
                          "external_cycle_id", "last_actual_reset_at", "cycle_start_at", "expected_reset_at", "timezone",
                          "unit_verified", "total_bytes", "remaining_bytes"},
@@ -129,8 +131,11 @@ def snapshot(store: ProductionStore, now=None) -> dict:
                      "last_error": worker["last_error"], "worker": _worker_public(worker)})
     from .mail import snapshot_mail
     value["mail"] = snapshot_mail(store)
+    from .registration import snapshot as registration_snapshot
+    value["registration"] = registration_snapshot(store, now)
     value["health"].update({"proxy": "parallel_workers", "metering": "native_payload",
-                            "mail": "smtp" if value["mail"]["configured"] else "not_enabled", "ssh": "fixed_control_entry"})
+                            "mail": "smtp" if value["mail"]["configured"] else "not_enabled", "ssh": "fixed_control_entry",
+                            "portal": store.get_meta("portal_worker_status", "not_observed")})
     return value
 
 
@@ -167,7 +172,7 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         if not isinstance(store, ProductionStore) or store.get_meta("mode") != "production":
             raise domain.DomainError("READ_ONLY", "An isolated production store and root policy are required")
         from .rpc import _validate
-        identifier, action, params = _validate(request)
+        identifier, action, params = _validate(request, allowed_actions=ALLOWED_ACTIONS)
         if action not in ALLOWED_ACTIONS:
             raise domain.DomainError("READ_ONLY", "This action is not available in production")
         if set(params) - PARAMETERS[action]:
@@ -232,9 +237,20 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
             data = render_export(store, domain._user(store, params), params.get("format", "shadowrocket"))
         elif action == "user.add":
             data = _add_user(store, params, now)
+        elif action.startswith("registration."):
+            from .registration import handle_admin
+            data = handle_admin(store, action, params, now)
+        elif action == "settings.update" and "registration_enabled" in params:
+            enabled = domain.boolean(params["registration_enabled"], "registration_enabled")
+            store.set_setting("registration_enabled", enabled)
+            remaining = {key: value for key, value in params.items() if key != "registration_enabled"}
+            data = domain.handle_action(store, action, remaining, now) if remaining else {}
         else:
             data = domain.handle_action(store, action, params, now)
         if action in WRITES:
+            if params.get("user_id") and action in {"user.rotate", "user.revoke", "user.delete"}:
+                from .registration import sync_user
+                sync_user(store, params["user_id"], now)
             if params.get("user_id") and action in {"user.enable", "user.disable", "user.revoke", "user.delete", "meter.reconcile"}:
                 store.conn.execute("UPDATE production_workers SET last_error=NULL WHERE user_id=?", (params["user_id"],))
             plan_jobs(store, now)
@@ -285,6 +301,21 @@ def refresh_worker_status(store: ProductionStore, helper=None, now=None) -> None
             raise ProductionError("HELPER_IDENTITY_MISMATCH", "Registered status probe identity mismatch")
         store.conn.execute("BEGIN IMMEDIATE")
         try:
+            # A managed helper job can finish while the status socket is in
+            # flight. Compare against the transactional row, not the pre-I/O
+            # snapshot; otherwise a legitimate new PID is treated as a restart.
+            before_probe = worker
+            current = store.conn.execute("SELECT * FROM production_workers WHERE worker_id=?", (worker["worker_id"],)).fetchone()
+            if current is None:
+                raise ProductionError("HELPER_IDENTITY_MISMATCH", "Registered worker disappeared")
+            worker = dict(current)
+            if (result["generation"] < worker["root_ack_generation"] and
+                    worker["root_ack_generation"] > before_probe["root_ack_generation"]):
+                # A newer acknowledged completion supersedes this older probe.
+                # The next probe must still match that newer root generation;
+                # genuine rollback with no concurrent advance remains an error.
+                store.conn.commit()
+                continue
             user = store.get_user(worker["user_id"])
             if result.get("tombstoned"):
                 store.conn.execute("UPDATE users SET revoked_at=COALESCE(revoked_at,?),manual_disabled=1 WHERE id=?", (timestamp(now), user["id"]))
@@ -569,6 +600,10 @@ def subscription_response(store: ProductionStore, token: str, route: str, now=No
                 user_id = row["user_id"]
     headers = {"Cache-Control": "no-store"}
     if user_id is None or route not in {"nodes.txt", "config.conf", "config.yaml"}:
+        if user_id is None and route in {"nodes.txt", "config.conf", "config.yaml"}:
+            from .registration import pending_token
+            if pending_token(store, token):
+                return {"status": 403, "headers": headers, "body": b""}
         return {"status": 404, "headers": headers, "body": b""}
     user = store.get_user(user_id)
     worker = store.worker(user_id)

@@ -269,6 +269,9 @@ def claim_messages(store, now, *, worker_id, limit=20, lease_seconds=60):
 
 
 def _still_authorized(store, message, now):
+    if message["kind"] in {"portal_verification", "portal_welcome", "portal_review", "portal_activated"}:
+        from .registration import authorize_mail
+        return authorize_mail(store, message, now)
     if message["kind"] == "verification":
         identity = "user:" + message["user_id"] if message["user_id"] else "admin"
         verification = store.conn.execute("SELECT * FROM mail_verifications WHERE identity=?", (identity,)).fetchone()
@@ -317,6 +320,9 @@ def finish_message(store, message_id, worker_id, now, *, error=None, transport="
         "UPDATE mail_outbox SET status=?,transport=?,completed_at=?,next_attempt_at=?,error_code=?,lease_owner=NULL,lease_until=NULL WHERE id=?",
         (status, transport, completed_at, next_attempt, error_code, message_id),
     )
+    if status == "sent" and row["kind"] == "portal_activated":
+        from .registration import mail_accepted
+        mail_accepted(store, message_id, now)
     if status in {"sent", "simulated", "dead"}:
         store.conn.execute("DELETE FROM mail_private_payload WHERE outbox_id=?", (message_id,))
     return True
@@ -532,7 +538,7 @@ def process_live_outbox(store, now=None, *, delivery=None):
             store.conn.commit()
             return {"processed": 1, "state": "cancelled"}
         payload = store.conn.execute("SELECT body FROM mail_private_payload WHERE outbox_id=?", (message["id"],)).fetchone()
-        if message["kind"] == "verification" and payload is None:
+        if message["kind"] in {"verification", "portal_verification", "portal_welcome", "portal_activated"} and payload is None:
             raise ValueError("Private verification payload is unavailable")
         if payload is not None:
             message["body"] = payload["body"]

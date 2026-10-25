@@ -25,10 +25,11 @@ import DazzleTransport
     var lastUpdated: Date? { serverUpdated }
     var users: [ProxyUser] { snapshot?.users ?? [] }
     var deletedUsers: [ProxyUser] { value("deleted_users").array.compactMap(ProxyUser.init) }
+    var registration: RegistrationOverview { RegistrationOverview(value("registration")) }
     var canModify: Bool { !busy && serverSnapshot != nil && serverReachable && !serverNeedsReview && serverContext?.canModify == true }
     private let defaults: UserDefaults
     private let managementFactory: @Sendable (String, String) throws -> SSHManagementRPC
-    private let readsWithoutRevision: Set<String> = ["snapshot", "status", "doctor", "user.list", "user.resolve", "deploy.preview", "rollback.preview", "mail.status"]
+    private let readsWithoutRevision: Set<String> = ["snapshot", "status", "doctor", "user.list", "user.resolve", "deploy.preview", "rollback.preview", "mail.status", "registration.list"]
 
     init(defaults: UserDefaults = .standard,
          managementFactory: @escaping @Sendable (String, String) throws -> SSHManagementRPC = { try SSHManagementRPC(host: $0, identityFile: $1) }) {
@@ -145,6 +146,8 @@ import DazzleTransport
     }
     private func actionNotice(_ action: String, params: [String: JSONValue]) -> String {
         switch action {
+        case "registration.approve": "启用请求已提交，正在等待实例和计量确认"
+        case "registration.reject": "申请已拒绝，订阅保持未启用"
         case "user.add": "用户已添加"
         case "user.update": "用户设置已保存"
         case "user.topup": "本周期额度已增加"

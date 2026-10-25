@@ -1,5 +1,11 @@
 # Parallel production pilot contract
 
+## Pending public registration extension
+
+The source includes a separate v2 extension for five new member resources (TCP/UDP24432–24436, loopback APIs34432–34436), an unprivileged HTTPS account portal and a peer-authenticated Unix API. It is not installed by the v1 pilot or program-only updater. New ports, web UID, helper/policy/service changes and ordinary-member maintenance need explicit deployment approval: restarting the agent pauses its bound member unit. Legacy443/8443, SSH and the administrator worker remain outside that maintenance scope.
+
+Public verification creates only an account and inactive subscription token. Only authenticated Mac approval can allocate an approved resource. Registration confirmation mail contains no URL; the VPS queues the first subscription email after actual running, trusted accounting and origin verification. Full URLs are confined to the verified recipient's private mail and authenticated personal page. SMTP acceptance is distinct from delivery. Recovery closes the portal while preserving subscriptions, active proxies, the ledger and revocations.
+
 Current authorization: the human explicitly approved parallel deployment while retaining the old proxy. The new server-side program has been installed; lock repair release `7b59b5cc8f22804c98211690` is active and six Linux lock regression checks passed. Old TCP/UDP443 sing-box and TCP8443 qqg-sub remain running, untouched and outside all new quotas/expiry/revoke logic. Legacy PIDs9515/11189 remained unchanged at the latest check. User enablement and actual runtime are assessed from fresh server state; trusted API-only stage is not active authorization. Retirement still requires a later separate human acceptance confirmation. New changes beyond the reviewed ports/accounts/helper scope require their own concrete review. Never import test databases or existing proxy credentials as new authorizations.
 
 ## Server-only product boundary

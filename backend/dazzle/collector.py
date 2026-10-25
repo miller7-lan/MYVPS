@@ -135,6 +135,8 @@ def tick(store, now=None):
     try:
         result = domain._cycle_tick(store, now)
         plan_jobs(store, now)
+        from .registration import queue_activation_notices
+        queue_activation_notices(store, now)
         if result["transitioned"]:
             store.set_meta("revision", store.revision + 1)
         store.conn.commit()
@@ -215,6 +217,8 @@ def run(store, helper=None):
     executor = HelperExecutor(store, helper)
     from .mail import MailExecutor
     mail_executor = MailExecutor(store)
+    from .portal_rpc import PortalExecutor
+    portal_executor = PortalExecutor(store)
     def stop(*_):
         stopped.set()
     signal.signal(signal.SIGTERM, stop)
@@ -225,6 +229,10 @@ def run(store, helper=None):
             tick(store)
             executor.start()
             mail_executor.start()
+            try:
+                portal_executor.start()
+            except Exception:
+                portal_executor.failed.set()  # Portal failure must not stop existing proxy workers.
             notify("READY=1")
             while not stopped.is_set():
                 began = time.monotonic()
@@ -235,6 +243,9 @@ def run(store, helper=None):
                 mail_state = "error" if mail_executor.failed.is_set() else "running"
                 if store.get_meta("mail_worker_status") != mail_state:
                     store.set_meta("mail_worker_status", mail_state)
+                portal_state = "not_enabled" if not portal_executor.enabled else "error" if portal_executor.failed.is_set() else "running"
+                if store.get_meta("portal_worker_status") != portal_state:
+                    store.set_meta("portal_worker_status", portal_state)
                 if executor.fatal.is_set():
                     raise ProductionError("HELPER_EXECUTOR_FAILED", "Registered worker executor failed")
                 results = []
@@ -251,6 +262,7 @@ def run(store, helper=None):
                 notify("WATCHDOG=1")
                 stopped.wait(max(0, 0.5 - (time.monotonic() - began)))
         finally:
+            portal_executor.close()
             mail_executor.close()
             executor.close()
             collectors.close()

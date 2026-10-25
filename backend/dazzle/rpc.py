@@ -27,14 +27,14 @@ def _response(request_id, revision: int, *, data=None, code=None, message=None) 
             "error": None if code is None else {"code": code, "message": message}}
 
 
-def _validate(request: dict) -> tuple[str, str, dict]:
+def _validate(request: dict, *, allowed_actions=None) -> tuple[str, str, dict]:
     if not isinstance(request, dict) or request.get("api_version") != 1 or type(request.get("api_version")) is not int:
         raise DomainError("VALIDATION", "api_version must be 1")
     identifier = request.get("request_id")
     if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", identifier):
         raise DomainError("VALIDATION", "request_id must be a safe opaque identifier")
     action = request.get("action")
-    if not isinstance(action, str) or action not in READ_ACTIONS | MUTATIONS:
+    if not isinstance(action, str) or action not in (READ_ACTIONS | MUTATIONS if allowed_actions is None else allowed_actions):
         raise DomainError("UNSUPPORTED", "Unsupported action")
     params = request.get("params", {})
     if not isinstance(params, dict):

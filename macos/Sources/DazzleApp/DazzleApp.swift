@@ -15,10 +15,10 @@ import DazzleModels
 }
 
 enum Page: String, CaseIterable, Identifiable {
-    case dashboard = "概览", users = "用户", mail = "通知", settings = "设置"
+    case dashboard = "概览", users = "用户", registrations = "注册申请", mail = "通知", settings = "设置"
     var id: Self { self }
     var icon: String {
-        switch self { case .dashboard: "chart.pie"; case .users: "person.2"; case .mail: "bell"; case .settings: "slider.horizontal.3" }
+        switch self { case .dashboard: "chart.pie"; case .users: "person.2"; case .registrations: "person.badge.clock"; case .mail: "bell"; case .settings: "slider.horizontal.3" }
     }
 }
 enum SettingsSection: String, CaseIterable, Identifiable {
@@ -72,7 +72,7 @@ struct MainView: View {
                 Text("Dazzle'VPS").font(.system(size: 18, weight: .semibold, design: .rounded))
             }.padding(.horizontal, 10).padding(.top, 17)
             VStack(spacing: 5) {
-                ForEach(Page.allCases) { item in NavigationItem(item: item, selected: page == item) { page = item } }
+                ForEach(Page.allCases) { item in NavigationItem(item: item, selected: page == item, badge: item == .registrations ? store.registration.pendingCount : 0) { page = item } }
             }
             Spacer()
             HStack(spacing: 7) {
@@ -107,6 +107,7 @@ struct MainView: View {
             case .dashboard:
                 DashboardPage(store: store, onUsers: { selectedUser = nil; page = .users }, onUser: { id in selectedUser = id; page = .users }, onSettings: { settings = .cycles; page = .settings })
             case .users: UsersPage(store: store, initialSelection: selectedUser)
+            case .registrations: RegistrationsPage(store: store, openUser: { id in selectedUser = id; page = .users })
             case .mail: MailPage(store: store)
             case .settings:
                 Picker("设置类别", selection: $settings) { ForEach(SettingsSection.allCases) { Text($0.rawValue).tag($0) } }
@@ -133,11 +134,11 @@ struct MainView: View {
 }
 
 private struct NavigationItem: View {
-    let item: Page; let selected: Bool; let action: () -> Void
+    let item: Page; let selected: Bool; var badge: Int = 0; let action: () -> Void
     @State private var hovered = false
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 10) { Image(systemName: item.icon).font(.system(size: 16)).frame(width: 22); Text(item.rawValue).font(.system(size: 13, weight: selected ? .semibold : .regular)); Spacer() }
+            HStack(spacing: 10) { Image(systemName: item.icon).font(.system(size: 16)).frame(width: 22); Text(item.rawValue).font(.system(size: 13, weight: selected ? .semibold : .regular)).lineLimit(1).minimumScaleFactor(0.8); Spacer(); if badge > 0 { Text(badge > 99 ? "99+" : String(badge)).font(.system(size: 10, weight: .semibold)).padding(.horizontal, 6).padding(.vertical, 3).background(VPSTheme.accent.opacity(0.12), in: Capsule()) } }
                 .foregroundStyle(selected ? VPSTheme.accent : .primary.opacity(0.75))
                 .padding(.horizontal, 12).padding(.vertical, 11)
                 .background(selected ? VPSTheme.accent.opacity(0.09) : hovered ? Color.primary.opacity(0.035) : .clear, in: RoundedRectangle(cornerRadius: 11))

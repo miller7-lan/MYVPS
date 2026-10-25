@@ -12,6 +12,8 @@ dependencies = []
 [project.optional-dependencies]
 native = ["protobuf>=7.35.1,<8"]
 test-proto = ["grpcio-tools>=1.76,<2"]
+portal = ["starlette==1.10.0", "uvicorn==0.54.0", "qrcode==8.2"]
+portal-test = ["httpx==0.28.1"]
 
 [project.scripts]
 dazzle-vps = "dazzle.__main__:main"
@@ -22,3 +24,4 @@ include = ["dazzle*"]
 
 [tool.setuptools.package-data]
 "dazzle.proto" = ["*.proto"]
+"dazzle" = ["portal_static/*.html", "portal_static/*.css", "portal_static/*.js"]

@@ -318,6 +318,44 @@ class ProductionTests(unittest.TestCase):
         self.assertTrue(self.process(seconds=2)["applied"])
         self.assertEqual(self.store.worker(user)["observed_state"], "staged")
 
+    def test_status_probe_rereads_managed_completion_before_comparing_pid(self):
+        user = self.staged()
+        self.call("user.enable", {"user_id": user})
+        helper = self.helper
+        store = self.store
+        now = self.now
+        class CompletesWhileProbing:
+            def call(inner, request):
+                self.assertTrue(process_one_job(store, helper, now=now)["applied"])
+                return helper.call(request)
+        refresh_worker_status(store, CompletesWhileProbing(), now)
+        self.assertEqual(store.worker(user)["observed_state"], "running")
+        self.assertTrue(store.get_user(user)["trusted_sample"])
+        self.assertNotIn("metering_failure", domain.disabled_reasons(store.get_user(user)))
+
+    def test_status_probe_older_than_concurrent_ack_cannot_rewind_generation(self):
+        user = self.staged()
+        self.call("user.enable", {"user_id": user})
+        helper = self.helper
+        store = self.store
+        now = self.now
+        class CapturesBeforeCompletion:
+            def call(inner, request):
+                old_result = helper.call(request)
+                self.assertTrue(process_one_job(store, helper, now=now)["applied"])
+                return old_result
+        refresh_worker_status(store, CapturesBeforeCompletion(), now)
+        self.assertEqual(store.worker(user)["observed_state"], "running")
+        self.assertEqual(store.worker(user)["root_ack_generation"], helper.records[user]["generation"])
+        self.assertTrue(store.get_user(user)["trusted_sample"])
+
+    def test_status_probe_still_rejects_actual_root_generation_rollback(self):
+        user = self.running()
+        self.helper.records[user]["generation"] -= 1
+        with self.assertRaises(ProductionError) as error:
+            refresh_worker_status(self.store, self.helper, self.now)
+        self.assertEqual(error.exception.code, "ROOT_REGISTRY_ROLLBACK")
+
     def test_root_tombstone_overlays_restored_local_credentials(self):
         user = self.staged()
         self.helper.records[user].update(tombstoned=True, worker_state="revoked", process_id=None)

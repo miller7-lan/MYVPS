@@ -141,8 +141,12 @@ def atomic_json(path, value, trusted_uid=0):
 
 def validate_policy(value):
     required = {"version", "server_id", "server_endpoint", "agent_uid", "core_sha256", "workers"}
-    if not isinstance(value, dict) or set(value) != required or value["version"] != 1:
+    if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] not in {1, 2}:
         raise HelperError("POLICY", "Unsupported root policy")
+    if value["version"] == 2:
+        required.add("portal_uid")
+    if set(value) != required:
+        raise HelperError("POLICY", "Unexpected root policy fields")
     canonical_uuid(value["server_id"])
     try:
         endpoint = ipaddress.ip_address(value["server_endpoint"])
@@ -152,6 +156,8 @@ def validate_policy(value):
         raise HelperError("POLICY", "Root policy requires an approved IPv4 endpoint") from None
     if type(value["agent_uid"]) is not int or value["agent_uid"] <= 0:
         raise HelperError("POLICY", "Root policy requires an installed agent UID")
+    if value["version"] == 2 and (type(value.get("portal_uid")) is not int or value["portal_uid"] <= 0 or value["portal_uid"] == value["agent_uid"]):
+        raise HelperError("POLICY", "A distinct installed portal UID is required")
     if value["core_sha256"] != CORE_SHA256:
         raise HelperError("POLICY", "Root policy has an invalid core digest")
     if not isinstance(value["workers"], dict) or not value["workers"]:
@@ -163,9 +169,14 @@ def validate_policy(value):
             raise HelperError("POLICY", "Invalid registered worker")
         role = worker["role"]
         expected = {"admin": (24430, 34430), "member": (24431, 34431)}.get(role)
+        if value["version"] == 2 and role == "member":
+            public = worker["public_port"]
+            if type(public) is not int or not 24431 <= public <= 24436:
+                raise HelperError("POLICY", "Worker is outside the approved resource pool")
+            expected = (public, public + 10000)
         if expected is None or type(worker["public_port"]) is not int or type(worker["api_port"]) is not int or (worker["public_port"], worker["api_port"]) != expected:
             raise HelperError("POLICY", "Worker ports are outside the approved pilot")
-        if role in roles or any(port in occupied for port in expected):
+        if (role in roles and (value["version"] == 1 or role == "admin")) or any(port in occupied for port in expected):
             raise HelperError("POLICY", "Duplicate pilot slot")
         roles.append(role); occupied.update(expected)
     return value
