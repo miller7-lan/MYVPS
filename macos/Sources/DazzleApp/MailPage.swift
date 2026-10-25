@@ -19,15 +19,17 @@ struct MailPage: View {
                     IconTile(symbol: "envelope")
                     VStack(alignment: .leading, spacing: 5) {
                         Text("邮件提醒").font(.headline)
-                        Text(status.configured ? "发件设置已保存" : status.secretConfigured ? "请完成发件设置" : "请保存发件设置与邮箱授权码")
+                        Text(status.configured ? "统一发件设置已保存" : status.secretConfigured ? "请完成统一发件设置" : "请设置管理员发件账号与授权码")
                             .font(.caption).foregroundStyle(VPSTheme.muted)
                     }
                     Spacer()
                     Toggle("邮件提醒", isOn: Binding(get: { status.enabled }, set: { value in
                         Task { await store.perform("mail.preferences", ["enabled": .bool(value)]) }
                     })).labelsHidden().toggleStyle(.switch).disabled(!store.canPerform("mail.preferences"))
-                    Button("发件设置") { settings = true }.disabled(!store.canPerform("mail.configure"))
+                    Button("统一发件设置") { settings = true }.disabled(!store.canPerform("mail.configure"))
                 }
+                Text("所有通知共用管理员发件账号，用户只需验证收件邮箱。")
+                    .font(.caption).foregroundStyle(VPSTheme.muted)
             }
             Card("绑定与验证") {
                 HStack {
@@ -46,7 +48,7 @@ struct MailPage: View {
                 }
                 if address.isEmpty && recipient != "admin" { Text("先在用户详情中编辑通知邮箱。").font(.caption).foregroundStyle(VPSTheme.muted) }
                 if !status.configured {
-                    Label("完成发件设置和授权码后才能发送验证邮件", systemImage: "key")
+                    Label("管理员完成统一发件设置后即可发送验证码", systemImage: "key")
                         .font(.caption).foregroundStyle(.orange)
                 } else if !status.enabled {
                     Label("先开启邮件提醒", systemImage: "bell.slash").font(.caption).foregroundStyle(.orange)
@@ -129,7 +131,7 @@ private struct SMTPSettingsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            HStack { Text("发件与管理员邮箱").font(.title2.weight(.semibold)); Spacer(); Button("完成") { secret = ""; dismiss() }.disabled(store.busy) }
+            HStack { Text("统一发件设置").font(.title2.weight(.semibold)); Spacer(); Button("完成") { secret = ""; dismiss() }.disabled(store.busy) }
             Form {
                 Picker("服务", selection: $preset) {
                     Text("QQ 邮箱 · 465 SSL").tag("qq465")
