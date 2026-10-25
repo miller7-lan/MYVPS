@@ -64,7 +64,12 @@ PARAMETERS = {
     "witness_wait_seconds": (30.0, 0.0, 300.0),
     "quota_margin_bytes": (1 << 30, 0, 1 << 40),
     "cycle_margin_seconds": (900, 60, 86400),
+    "host_stall_lookback_seconds": (86400, 3600, 7 * 86400),  # any kernel report of a VM pause in it blocks approval
+    "max_steal_before_stop": (0.2, 0.0, 2.0),     # hypervisor steal tolerated from verification to the stop
 }
+# Kernel lines that mean this VM (or a CPU) did not run. Pauses outlast the 5 s guards.
+STALL_KINDS = (("clocksource_skip", "Long readout interval"), ("rt_throttling", "RT throttling activated"),
+               ("soft_lockup", "soft lockup"), ("rcu_stall", "self-detected stall"), ("hung_task", "blocked for more than"))
 UNIT_PROPERTIES = ("LoadState", "ActiveState", "SubState", "MainPID", "NRestarts", "InvocationID", "FragmentPath",
                    "DropInPaths", "BindsTo", "After", "StatusText", "UnitFileState", "NeedDaemonReload",
                    "ExecMainStartTimestampMonotonic", "ActiveEnterTimestampMonotonic")
@@ -172,6 +177,19 @@ def parse_instant(value):
     if result.tzinfo is None:
         raise ValueError("Timestamp requires a timezone")
     return result.astimezone(dt.timezone.utc)
+
+
+def parse_stalls(text):
+    """`journalctl -k -o short-unix` lines → stall records; cs_nsec is the length of the clocksource skip."""
+    stalls = []
+    for line in text.splitlines():
+        match = re.match(r"(\d+(?:\.\d+)?) \S+ kernel: (.*)", line)
+        kind = match and next((name for name, needle in STALL_KINDS if needle in match.group(2)), None)
+        if kind:
+            length = re.search(r"cs_nsec: (\d+)", match.group(2))
+            stalls.append({"at": float(match.group(1)), "kind": kind,
+                           "seconds": round(int(length.group(1)) / 1e9, 3) if length else None})
+    return stalls
 
 
 def validate_parameters(values=None):
@@ -527,6 +545,21 @@ class Host:
     def sleep(self, seconds):
         time.sleep(seconds)
 
+    def steal_seconds(self):
+        """Cumulative time the hypervisor did not run this VM (/proc/stat steal)."""
+        fields = (self.layout.proc / "stat").read_text().split("\n", 1)[0].split()
+        if len(fields) < 9 or fields[0] != "cpu":
+            raise ValueError("Unexpected /proc/stat layout")
+        return int(fields[8]) / os.sysconf("SC_CLK_TCK")
+
+    def host_stalls(self, lookback_seconds):
+        result = self.runner.run(["/usr/bin/journalctl", "--dmesg", "--boot", "--since", "-%ds" % int(lookback_seconds),
+                                  "--output", "short-unix", "--no-pager", "--quiet",
+                                  "--grep", "|".join(needle for _, needle in STALL_KINDS)], timeout=30)
+        if result.returncode not in (0, 1):  # 1: nothing matched
+            raise ValueError("The kernel log cannot be read")
+        return parse_stalls(result.stdout.decode("utf-8", "replace"))
+
     def ledger(self):
         account = pwd.getpwnam(self.layout.agent_account)
         return LedgerReader(self.layout.database, user=account.pw_uid, group=account.pw_gid,
@@ -743,9 +776,11 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
         raise ValueError("The writer lock cannot be observed") from None
 
     now = host.wall()
+    steal_before = host.steal_seconds()
     with host.ledger() as ledger:
         facts = ledger.facts()
         phase = observe_phase(host, ledger, units_members(units)) if measurements is None else None
+    steal_during = round(host.steal_seconds() - steal_before, 3)
     if facts["meta"].get("server_id") != policy["server_id"] or facts["meta"].get("mode") != "production":
         raise ValueError("Ledger identity does not match the root policy")
     if facts["jobs_active"]:
@@ -791,6 +826,14 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
         _issue(issues, "FALLBACK_TIMING", "The original writer start-to-ready time is unknown")
     elif best_age > parameters["max_sample_age_at_stop"] or reserve > available or other_age + window > FRESHNESS_LIMIT:
         _issue(issues, "FALLBACK_BUDGET", "At the writer's best observed sample phase a fallback to the pinned old writer would not fit the remaining sample deadline; the old writer will not be stopped")
+    # A paused VM resumes with every sample and watchdog expired; guards then stop members.
+    stalls = host.host_stalls(parameters["host_stall_lookback_seconds"])
+    longest = max((stall["seconds"] or 0.0 for stall in stalls), default=0.0)
+    if stalls:
+        _issue(issues, "HOST_STALLS", "The kernel reported %d pause(s) of this VM in the last %d h (longest %.1f s); wait for a stable host"
+               % (len(stalls), parameters["host_stall_lookback_seconds"] // 3600, longest))
+    if steal_during > parameters["max_steal_before_stop"]:
+        _issue(issues, "HOST_STEAL", "The hypervisor did not run this VM for %.2f s while the writer was observed" % steal_during, volatile=True)
 
     reviewed = {
         "server_id": policy["server_id"], "policy_sha256": sha256(policy_bytes),
@@ -815,7 +858,9 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
     blocking = [issue for issue in issues if not issue["volatile"]]
     return {"version": 1, "operation": OPERATION, "plan_id": plan_id, "reviewed": reviewed, "measurements": measurements,
             "observed": {"at": now.isoformat(), "ledger_age_seconds": {key: round(value, 3) for key, value in ages.items()},
-                         "member_witness_connections": witness},
+                         "member_witness_connections": witness,
+                         "host": {"stalls_in_lookback": len(stalls), "longest_stall_seconds": longest,
+                                  "steal_during_observation_seconds": steal_during}},
             "issues": issues, "ready_for_approval": not issues, "blocking_issues": len(blocking),
             "notice": "Apply holds management, proves every check again and stops the old writer only inside the measured budget. A failed takeover falls back to the pinned old writer on a best-effort basis; guards stay fail-closed."}
 
@@ -973,6 +1018,7 @@ class Coordinator:
         self.require(fresh["reviewed"] == self.reviewed, "Reviewed facts changed since the approved plan")
         blocking = [issue["message"] for issue in fresh["issues"] if not issue["volatile"]]
         self.require(not blocking, "Current state has unresolved blocking issues: " + "; ".join(blocking))
+        self.steal_at_verification = self.host.steal_seconds()
         self.step("plan_reverified")
 
     def hold_control(self):
@@ -1155,6 +1201,10 @@ class Coordinator:
                 break
             self.require(self.host.monotonic() <= deadline, "No safe stop moment: the remaining sample budget could not also cover a fallback")
             self.host.sleep(0.015)
+        stolen = round(self.host.steal_seconds() - self.steal_at_verification, 3)
+        self.journal["host_steal_before_stop_seconds"] = stolen
+        self.require(stolen <= parameters["max_steal_before_stop"],
+                     "The hypervisor paused this VM after verification; the old writer was not stopped")
         stopped_mono, stopped_wall = self.host.monotonic(), self.host.wall()
         guard_deadline = decided + FRESHNESS_LIMIT - age  # Member guards expire from the observed age, not from now.
         takeover_deadline = stopped_mono + parameters["takeover_deadline"]
@@ -1386,7 +1436,9 @@ class Coordinator:
                             self.journal["status"] = "taken_over_writer_review_required"
                 except Exception as exc:
                     if not isinstance(exc, Abort):
-                        self.journal["unexpected_error"] = f"{type(exc).__name__}: {exc}"
+                        # Like main(): only our own messages; foreign exception text may contain values.
+                        own = isinstance(exc, (ValueError, HelperError)) and len(str(exc)) < 300
+                        self.journal["unexpected_error"] = type(exc).__name__ + (": " + str(exc) if own else "")
                     if not self.old_stopped:
                         self.revert(str(exc) if isinstance(exc, Abort) else "Unexpected failure before the old writer was stopped")
                     elif self.journal["status"] == "started":
@@ -1458,6 +1510,7 @@ def main(argv=None):
     parser.add_argument("--plan", type=Path)
     parser.add_argument("--approval", type=Path)
     parser.add_argument("--archive", type=Path)
+    parser.add_argument("--parameters", type=Path, help="reviewed timing parameters (JSON) for --preview")
     args = parser.parse_args(argv)
     try:
         if os.geteuid() != 0 or platform.system() != "Linux":
@@ -1469,7 +1522,8 @@ def main(argv=None):
                 raise ValueError("Staging requires the archive and its approval")
             result = stage_release(host, layout, args.archive, json.loads(args.approval.read_text()))
         elif args.preview:
-            plan = build_plan(host, layout, ReleaseRenderer(), new_release_id=args.new_release_id)
+            parameters = json.loads(args.parameters.read_text()) if args.parameters else None
+            plan = build_plan(host, layout, ReleaseRenderer(), new_release_id=args.new_release_id, parameters=parameters)
             result = {"mode": "preview", "production_modified": False, "plan_sha256": sha256(canonical(plan)), "plan": plan}
         else:
             if not args.plan or not args.approval:

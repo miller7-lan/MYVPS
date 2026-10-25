@@ -26,7 +26,7 @@ import uuid
 HERE = Path(__file__).resolve().parent
 REPOSITORY = HERE.parents[2]
 sys.path.insert(0, str(REPOSITORY))
-from deployment.coordinator import LAUNCHER, LedgerReader  # noqa: E402
+from deployment.coordinator import LAUNCHER, PARAMETERS, LedgerReader  # noqa: E402
 from deployment.helper import CORE_SHA256  # noqa: E402
 from deployment.installer import canonical, sha256  # noqa: E402
 from deployment.portal_release import portal_sources  # noqa: E402
@@ -215,7 +215,11 @@ class Rehearsal:
 
     def execute(self):
         install("/etc/dazzle-vps/fixture-mode", (self.scenario if self.scenario.endswith("-takeover") else "").encode() + b"\n", 0o644)
-        preview = self.coordinator("--preview", "--new-release-id", self.new_release)
+        # A shared CI VM accrues some hypervisor steal; the target keeps the stricter defaults.
+        parameters = {name: spec[0] for name, spec in PARAMETERS.items()}
+        parameters.update(host_stall_lookback_seconds=3600, max_steal_before_stop=2.0)
+        install(self.private / "parameters.json", json.dumps(parameters).encode(), 0o600)
+        preview = self.coordinator("--preview", "--new-release-id", self.new_release, "--parameters", str(self.private / "parameters.json"))
         plan = preview.get("plan") or {}
         if not plan.get("ready_for_approval"):
             raise AssertionError("plan not ready: " + json.dumps(preview.get("error") or plan.get("issues"))[:1500])

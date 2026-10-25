@@ -11,8 +11,8 @@ import uuid
 
 from deployment import coordinator
 from deployment.coordinator import (FRESHNESS_LIMIT, HOLD, LAUNCHER, Coordinator, Host, Layout, LedgerReader,
-                                    ReleaseRenderer, build_plan, parse_locks, parse_status, parse_tcp, process_identity,
-                                    sample_ages, validate_parameters)
+                                    ReleaseRenderer, build_plan, parse_locks, parse_stalls, parse_status, parse_tcp,
+                                    process_identity, sample_ages, validate_parameters)
 from deployment.helper import CORE_SHA256
 from deployment.installer import canonical, sha256
 
@@ -48,6 +48,7 @@ class World:
         self.reader_broken = False
         self.control_busy_until = 0.0
         self.unsafe_paths = set()  # Paths whose file or directory is writable by non-root users.
+        self.steal, self.stalls = 0.0, []  # Hypervisor steal seconds and kernel-reported VM pauses.
         self.server_id, self.admin, self.member = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
         self.policy = {"version": 1, "server_id": self.server_id, "server_endpoint": "8.8.8.8", "agent_uid": 991,
                        "core_sha256": CORE_SHA256, "workers": {self.admin: {"role": "admin", "public_port": 24430, "api_port": 34430},
@@ -336,6 +337,9 @@ class FakeHost:
         if str(path) in self.world.unsafe_paths:
             raise ValueError("Management entry cannot be swapped safely: Unsafe project file ownership or mode")
 
+    def steal_seconds(self): return self.world.steal
+    def host_stalls(self, lookback_seconds): return list(self.world.stalls)
+
     def exists(self, path): return str(path) in self.world.files or str(path) in self.world.dirs
 
     def write(self, path, payload, *, mode, gid=None):
@@ -413,6 +417,13 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(process_identity(stat, 321), "321:19")  # field 22, after a comm containing ") ("
         with self.assertRaises(ValueError):
             process_identity(stat, 322)
+
+    def test_kernel_pause_lines_are_parsed_with_their_length(self):
+        text = ("1792929085.1 vps kernel: clocksource: Long readout interval, skipping watchdog check: cs_nsec: 7898486955 wd_nsec: 7898482934\n"
+                "1792929085.2 vps kernel: sched: RT throttling activated\n"
+                "1792929090.0 vps kernel: [UFW BLOCK] IN=ens17 OUT= PROTO=TCP\n")
+        self.assertEqual([(stall["kind"], stall["seconds"]) for stall in parse_stalls(text)],
+                         [("clocksource_skip", 7.898), ("rt_throttling", None)])
 
     def test_parameters_cannot_extend_the_deadline_or_drop_the_fallback_budget(self):
         values = validate_parameters()
@@ -650,15 +661,46 @@ class CoordinatorTests(unittest.TestCase):
         original = self.host.write
         def write(path, payload, *, mode, gid=None):
             if str(path) == str(self.layout.control):
-                raise PermissionError("simulated refusal")
+                raise PermissionError("foreign text that may carry a value")
             return original(path, payload, mode=mode, gid=gid)
         self.host.write = write
         result = self.run_coordinator()
         self.assertEqual(result["status"], "aborted_no_core_or_writer_changed", result)
-        self.assertEqual(result["unexpected_error"], "PermissionError: simulated refusal")
+        self.assertEqual(result["unexpected_error"], "PermissionError")  # Foreign text is never echoed.
         self.assertEqual(self.world.files["/usr/local/bin/dazzle-vps-control"], LAUNCHER)
         self.assertEqual(self.world.calls, [])
         self.assert_original_layout()
+
+    def test_recent_vm_pause_blocks_approval_and_a_later_one_stops_apply_before_changes(self):
+        # 2026-10-25: the live VM paused for 7.9 s and 29.5 s; 5 s guards would have stopped members.
+        self.world.stalls.append({"at": 0.0, "kind": "clocksource_skip", "seconds": 7.898})
+        plan = self.plan()
+        self.assertFalse(plan["ready_for_approval"])
+        self.assertIn("HOST_STALLS", {issue["code"] for issue in plan["issues"]})
+        self.assertEqual(plan["observed"]["host"]["longest_stall_seconds"], 7.898)
+        self.world.stalls.clear()
+        plan = self.plan()
+        self.world.stalls.append({"at": 1.0, "kind": "clocksource_skip", "seconds": 29.497})
+        result = Coordinator(self.host, self.layout, ReleaseRenderer(), plan, approve(plan)).run()
+        self.assertIn("pause(s) of this VM", result["abort_reason"])
+        self.assertEqual(self.world.calls, [])
+
+    def test_steal_after_verification_aborts_before_the_old_writer_is_stopped(self):
+        plan = self.plan()
+        self.world.at(2.0, lambda: setattr(self.world, "steal", self.world.steal + 7.9))  # a pause while guards warm up
+        result = self.run_coordinator(plan)
+        self.assertEqual(result["status"], "aborted_no_core_or_writer_changed", result)
+        self.assertIn("paused this VM", result["abort_reason"])
+        self.assertEqual(result["host_steal_before_stop_seconds"], 7.9)
+        self.assertFalse(any(call[:3] == ("stop", "--no-block", self.world.w1) for call in self.world.calls))
+        self.assert_original_layout()
+        self.assert_never_restarted_a_core()
+
+    def test_steal_while_the_preview_observes_the_writer_is_not_approvable(self):
+        self.world.at(1.0, lambda: setattr(self.world, "steal", self.world.steal + 0.5))
+        plan = self.plan()
+        self.assertIn("HOST_STEAL", {issue["code"] for issue in plan["issues"]})
+        self.assertFalse(plan["ready_for_approval"])
 
     def test_in_flight_management_call_that_never_ends_aborts_and_restores_entry(self):
         self.world.control_busy_until = self.world.time + 999
