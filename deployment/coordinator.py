@@ -38,6 +38,7 @@ import uuid
 
 from .handoff import OLD_POLICY_SNAPSHOT, OLD_WRITER, guard_name, render_existing_member, render_old_writer_fallback
 from .helper import HelperError, Runner, atomic_bytes, canonical_uuid, checked_path, validate_policy
+from .member_gate import DROP_IN as GATE_DROP_IN, GATE_SETTINGS, OPENED as GATE_OPENED
 from .installer import canonical, sha256
 
 OPERATION = "live_writer_handoff"
@@ -72,7 +73,7 @@ STALL_KINDS = (("clocksource_skip", "Long readout interval"), ("rt_throttling", 
                ("soft_lockup", "soft lockup"), ("rcu_stall", "self-detected stall"), ("hung_task", "blocked for more than"))
 UNIT_PROPERTIES = ("LoadState", "ActiveState", "SubState", "MainPID", "NRestarts", "InvocationID", "FragmentPath",
                    "DropInPaths", "BindsTo", "After", "StatusText", "UnitFileState", "NeedDaemonReload",
-                   "ExecMainStartTimestampMonotonic", "ActiveEnterTimestampMonotonic")
+                   "ExecMainStartTimestampMonotonic", "ActiveEnterTimestampMonotonic", "Wants", "IPAddressDeny", "ControlGroup")
 FAST_PROPERTIES = ("ActiveState", "SubState", "MainPID", "StatusText")
 
 
@@ -605,11 +606,13 @@ class Host:
 class ReleaseRenderer:
     """Pure text rendering from the staged release and observed live sources."""
     def guard_template(self, text, release_id):
-        if text.count("@RELEASE_ID@") != 1:
-            raise ValueError("Guard template must pin exactly one release")
+        if text.count("@RELEASE_ID@") != 3:
+            raise ValueError("Guard template must pin its guard and gate commands to one release")
         body = text.replace("@RELEASE_ID@", release_id)
-        expected = "ExecStart=/opt/dazzle-vps/releases/" + release_id + "/venv/bin/python -I -m dazzle.meter_guard "
-        if (body.count(expected) != 1 or "/current/" in body or re.search(r"@[A-Z_]+@", body)
+        python = "/opt/dazzle-vps/releases/" + release_id + "/venv/bin/python -I -m "
+        expected = ("ExecStart=" + python + "dazzle.meter_guard ", "ExecStartPost=+" + python + "deployment.member_gate open %i\n",
+                    "ExecStopPost=+/bin/sh -c '" + python + "deployment.member_gate close %i ", "\nRestartPreventExitStatus=3\n")
+        if (any(body.count(line) != 1 for line in expected) or "/current/" in body or re.search(r"@[A-Z_]+@", body)
                 or "BindsTo=" in body or "Requires=" in body or "ReadWritePaths=/var/lib/dazzle-vps" in body):
             raise ValueError("Guard template is not the reviewed independent read-only guard")
         return body.encode()
@@ -632,8 +635,10 @@ class ReleaseRenderer:
         return render_old_writer_fallback(unit, previous_release_id).encode()
 
     def guarded_member_template(self, text):
-        if "BindsTo=dazzle-vps-meter-guard@%i.service" not in text or "/current/" in text:
-            raise ValueError("Future member template is not bound to its own guard")
+        required = ("\nWants=network-online.target dazzle-vps-meter-guard@%i.service\n", "\nAfter=network-online.target dazzle-vps-meter-guard@%i.service\n",
+                    "\nSlice=system.slice\n", "\nIPAddressAllow=localhost\nIPAddressDeny=any\n")
+        if any(line not in text for line in required) or "BindsTo=" in text or "/current/" in text:
+            raise ValueError("Future member template is not gated by its own guard")
         return text.encode()
 
 
@@ -647,7 +652,9 @@ def observe_unit(host, unit, properties=UNIT_PROPERTIES):
                 "after": sorted(fields.get("After", "").split()), "status": fields.get("StatusText", ""),
                 "file_state": fields.get("UnitFileState", ""), "need_reload": fields.get("NeedDaemonReload", ""),
                 "exec_start_us": int(fields.get("ExecMainStartTimestampMonotonic") or 0),
-                "active_enter_us": int(fields.get("ActiveEnterTimestampMonotonic") or 0)}
+                "active_enter_us": int(fields.get("ActiveEnterTimestampMonotonic") or 0),
+                "wants": sorted(fields.get("Wants", "").split()), "ip_deny": fields.get("IPAddressDeny", ""),
+                "cgroup": fields.get("ControlGroup", "")}
     except ValueError:
         raise ValueError("Unit state could not be parsed") from None
 
@@ -660,6 +667,26 @@ def process_record(host, observed):
         except (OSError, ValueError):
             pass
     return record
+
+
+CONTROL_DROPINS = Path("/run/systemd/system.control")
+
+
+def gate_path(layout, unit):
+    return layout.units / (unit + ".d") / GATE_DROP_IN
+
+
+def unknown_dropins(host, dropins, unit):
+    """Drop-ins other than the empty runtime resets that opening a member gate leaves behind."""
+    unknown = []
+    for path in dropins.split() if isinstance(dropins, str) else dropins:
+        name = Path(path).name
+        if Path(path).parent == CONTROL_DROPINS / (unit + ".d") and name in ("50-IPAddressDeny.conf", "50-IPAddressAllow.conf"):
+            lines = [line for line in (host.read(path) or b"").decode("utf-8", "replace").splitlines() if line and not line.startswith("#")]
+            if lines == ["[Service]", name[3:-5] + "="]:
+                continue
+        unknown.append(path)
+    return unknown
 
 
 def units_members(units):
@@ -742,6 +769,7 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
     for identifier, value in members.items():
         plan_file(layout.units / value["unit"], renderer.member_override(member_source.decode("utf-8"), identifier, value["guard"], layout.old_writer),
                   phase="adopt", mode=0o644)
+        plan_file(gate_path(layout, value["unit"]), GATE_SETTINGS, phase="adopt", mode=0o644)
     plan_file(template_path, renderer.guarded_member_template(template("guarded-member.service")), phase="finalize", mode=0o644,
               before=sha256(member_source))
 
@@ -756,9 +784,11 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
         processes["workers"][identifier] = process_record(host, observed)
         if (observed["active"], observed["sub"]) != ("active", "running") or observed["pid"] <= 0:
             _issue(issues, "WORKER_STATE", "A registered worker is not running: " + value["role"])
-        if value["role"] == "member" and (observed["fragment"] != str(template_path) or observed["dropins"]
+        if value["role"] == "member" and (observed["fragment"] != str(template_path) or unknown_dropins(host, observed["dropins"], value["unit"])
                                           or observed["binds_to"] != [layout.old_writer]):
             _issue(issues, "MEMBER_UNIT", "A member has an unreviewed unit source, drop-in or dependency")
+        if value["role"] == "member" and observed["cgroup"] != "/system.slice/" + value["unit"]:
+            _issue(issues, "MEMBER_SLICE", "A member must run directly in system.slice; a nested slice keeps a closed gate after reopening")
         if value["role"] == "admin" and (layout.old_writer in observed["binds_to"] or observed["dropins"]):
             _issue(issues, "ADMIN_UNIT", "The administrator must stay independent of the original writer")
     certsync = observe_unit(host, layout.certsync_unit)
@@ -848,11 +878,13 @@ def build_plan(host, layout, renderer, *, new_release_id, plan_id=None, paramete
                    "cycle_id": facts["cycle"]["id"] if facts["cycle"] else None},
         "control": {"path": str(layout.control), "original_sha256": sha256(LAUNCHER), "hold_sha256": sha256(HOLD)},
         "directories": {str(layout.handoff): {"mode": "0750", "group": layout.project_group},
-                        str(layout.guard_proofs): {"mode": "0750", "group": layout.project_group}},
+                        str(layout.guard_proofs): {"mode": "0750", "group": layout.project_group},
+                        **{str(gate_path(layout, value["unit"]).parent): {"mode": "0755", "group": "root"} for value in members.values()}},
         "parameters": parameters,
         # The installed sync runs with whatever `current` is; finalize proves it once on the new release.
         "certificate_sync": {"unit": layout.certsync_unit, "loaded": certsync["load"] == "loaded", "dropins": certsync["dropins"]},
         "unchanged": ["policy.json stays v1", "no new ports, accounts, firewall, SSH or 9443 change", "no Core restart",
+                      "a member's own unit filters its public traffic only while its gate is closed",
                       "ledger is never restored or reset", "registration stays closed", "certificate sources unchanged"],
     }
     blocking = [issue for issue in issues if not issue["volatile"]]
@@ -1123,20 +1155,29 @@ class Coordinator:
         self.require(current is not None and sha256(current) == self.file(template)["before_sha256"], "Member template changed since review")
         for identifier, value in self.members.items():
             observed = self.unit(value["unit"])
-            self.require(self.same_process(self.reviewed["processes"]["workers"][identifier], observed) and not observed["dropins"]
-                         and observed["binds_to"] == [self.units["old_writer"]] and observed["fragment"] == str(template),
-                         "A member changed before dependency adoption")
+            self.require(self.same_process(self.reviewed["processes"]["workers"][identifier], observed)
+                         and not unknown_dropins(self.host, observed["dropins"], value["unit"])
+                         and observed["binds_to"] == [self.units["old_writer"]] and observed["fragment"] == str(template)
+                         and observed["cgroup"] == "/system.slice/" + value["unit"], "A member changed before dependency adoption")
         for value in self.members.values():
-            self.adopted.append(str(self.layout.units / value["unit"]))
-            self.write_planned(self.layout.units / value["unit"])
+            # Open first: once the default-closed gate drop-in loads, this runtime reset keeps traffic flowing.
+            self.require(self.host.systemctl("set-property", "--runtime", value["unit"], *GATE_OPENED) == 0,
+                         "A member gate could not be opened before adoption")
+        for value in self.members.values():
+            unit, gate = self.layout.units / value["unit"], gate_path(self.layout, value["unit"])
+            self.adopted.extend([str(unit), str(gate)])
+            self.write_planned(unit)
+            self.host.directory(gate.parent, 0o755, 0)
+            self.write_planned(gate)
         self.require(self.reload(), "systemd daemon-reload failed")
         for identifier, value in self.members.items():
             observed = self.unit(value["unit"])
             self.require(self.same_process(self.reviewed["processes"]["workers"][identifier], observed) and observed["need_reload"] == "no"
-                         and observed["binds_to"] == [value["guard"]] and value["guard"] in observed["after"]
-                         and self.units["old_writer"] not in observed["after"] and not observed["dropins"]
+                         and not observed["binds_to"] and value["guard"] in observed["wants"] and value["guard"] in observed["after"]
+                         and self.units["old_writer"] not in observed["after"] and not observed["ip_deny"]
+                         and unknown_dropins(self.host, observed["dropins"], value["unit"]) == [str(gate_path(self.layout, value["unit"]))]
                          and observed["fragment"] == str(self.layout.units / value["unit"]),
-                         "The actual member dependency transfer was not proven")
+                         "The actual member dependency and gate transfer was not proven")
         self.step("dependencies_adopted", members=len(self.members))
 
     def gate(self):
@@ -1160,7 +1201,9 @@ class Coordinator:
             observed = self.unit(value["unit"])
             self.require(self.same_process(self.reviewed["processes"]["workers"][identifier], observed),
                          "A registered Core is not the same live process")
-            self.require(value["role"] != "member" or observed["binds_to"] == [value["guard"]], "A member is not bound to its own guard")
+            self.require(value["role"] != "member" or (not observed["binds_to"] and value["guard"] in observed["wants"]),
+                         "A member is not owned by its own guard")
+            self.require(value["role"] != "member" or not observed["ip_deny"], "A member gate is closed")
         facts, now, ledger = self.ledger.facts(), self.host.wall(), self.reviewed["ledger"]
         self.require(facts["meta"].get("revision") == ledger["revision"] and not facts["jobs_active"]
                      and facts["incidents_total"] == ledger["incidents_total"] and not facts["meta"].get("agent_recovery_only")
@@ -1259,8 +1302,10 @@ class Coordinator:
             self.host.sleep(0.02)
         restart_wall = self.host.wall()
         self.host.systemctl("start", "--no-block", self.units["old_writer"])
-        fresh_at, watch_until = None, guard_deadline + 10.0
+        fresh_at, watch_until, paused = None, guard_deadline + 10.0, set()
         while self.host.monotonic() < watch_until:
+            # A guard whose samples aged past its limit closes the gate: traffic pauses, the Core stays.
+            paused |= {key for key, value in self.members.items() if (self.observe(value["unit"], ("IPAddressDeny",)) or {}).get("ip_deny")}
             old = self.observe(self.units["old_writer"])
             if old is not None and old["active"] == "active" and self.exclusive(old["pid"]):
                 # A Core already stopped by its guard can never sample again; it is reported below.
@@ -1272,7 +1317,7 @@ class Coordinator:
         interrupted = [key for key in self.members if key not in self.live_workers()]
         record.update({"old_writer_fresh_after": round(fresh_at - stopped_mono, 3) if fresh_at else None,
                        "within_sample_deadline": bool(fresh_at and fresh_at <= guard_deadline),
-                       "members_interrupted": len(interrupted)})
+                       "members_interrupted": len(interrupted), "members_traffic_paused": len(paused)})
         if fresh_at is None:
             self.journal["status"] = "fallback_failed_manual_review"
             self.step("fallback_failed")
@@ -1295,8 +1340,11 @@ class Coordinator:
         if not self.reload():
             return False
         for value in self.members.values():
+            # A guard may have closed the gate meanwhile; a restored member is never left closed.
+            if self.host.systemctl("set-property", "--runtime", value["unit"], *GATE_OPENED) != 0:
+                return False
             observed = self.observe(value["unit"], UNIT_PROPERTIES)
-            if observed is None or (observed["active"] == "active" and observed["binds_to"] != [self.units["old_writer"]]):
+            if observed is None or (observed["active"] == "active" and (observed["binds_to"] != [self.units["old_writer"]] or observed["ip_deny"])):
                 return False
         self.adopted = []
         return True
@@ -1327,8 +1375,11 @@ class Coordinator:
                 if guard is None or not self.guard_ready(identifier, guard) or guard["pid"] != self.guards[identifier]["pid"]:
                     preservation.add("a member guard restarted or stopped")
             for identifier, value in self.units["workers"].items():
-                if not self.same_process(self.reviewed["processes"]["workers"][identifier], self.observe(value["unit"], UNIT_PROPERTIES)):
+                observed = self.observe(value["unit"], UNIT_PROPERTIES)
+                if not self.same_process(self.reviewed["processes"]["workers"][identifier], observed):
                     preservation.add("a registered Core restarted or stopped")
+                elif value["role"] == "member" and observed["ip_deny"]:
+                    preservation.add("a member gate closed")
             if self.host.monotonic() >= end and samples >= 2:
                 break
             self.host.sleep(0.5)
@@ -1367,8 +1418,9 @@ class Coordinator:
             raise ValueError("systemd daemon-reload failed")
         for value in self.members.values():
             observed = self.unit(value["unit"])
-            if observed["fragment"] != str(self.layout.units / value["unit"]) or observed["binds_to"] != [value["guard"]]:
-                raise ValueError("A member stopped using its complete guarded unit")
+            if (observed["fragment"] != str(self.layout.units / value["unit"]) or observed["binds_to"]
+                    or value["guard"] not in observed["wants"] or observed["ip_deny"]):
+                raise ValueError("A member stopped using its complete gated unit")
         self.host.systemctl("disable", self.units["old_writer"])
         self.host.systemctl("enable", self.units["new_writer"])
         if (self.unit(self.units["old_writer"])["file_state"], self.unit(self.units["new_writer"])["file_state"]) != ("disabled", "enabled"):

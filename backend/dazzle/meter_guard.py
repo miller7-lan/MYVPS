@@ -1,8 +1,13 @@
 """One read-only, fail-closed meter guard per registered member.
 
 The guard never takes agent.lock, updates SQLite, controls a service, or sends
-mail. Its systemd unit is bound only to its own member; an error exits this one
-process. Native observations are evidence, never substituted ledger heartbeats.
+mail. Native observations are evidence, never substituted ledger heartbeats.
+
+Its unit owns the member's network gate: READY opens it, and any exit of this
+process closes it again (deployment.member_gate, run by systemd as root). A
+stale meter therefore pauses public traffic while the Core keeps its process
+and counters. Broken identity or authorization exits with EXIT_FATAL, and the
+gate then stops the Core instead.
 """
 from __future__ import annotations
 
@@ -25,6 +30,12 @@ from .production_state import POLICY_PATH, STATE_DIR, ProductionStore, load_poli
 from .store import parse_time, utcnow
 
 MAX_AGE = 5.0
+# Samples older than this close the gate, so it is shut before MAX_AGE even after
+# the loop period and the root gate command.
+GATE_AGE = 4.0
+EXIT_GATE = 75   # close the gate and restart the guard; the Core keeps running
+EXIT_FATAL = 3   # stop the Core; the guard is not restarted
+WAIT_CODES = frozenset({"STALE_OBSERVATION", "MISSING_TIMESTAMP", "NATIVE_WARMING", "UNTRUSTED_AUTHORIZATION_OR_METER"})
 PROOF_DIR = "/etc/dazzle-vps/guard-proofs"
 
 
@@ -45,11 +56,11 @@ def notify(message):
         connection.sendto(message.encode("ascii"), destination)
 
 
-def age(value, now):
+def age(value, now, limit=MAX_AGE):
     if not value:
         raise GuardError("MISSING_TIMESTAMP")
     result = (now - parse_time(value)).total_seconds()
-    if not 0 <= result <= MAX_AGE:
+    if not 0 <= result <= limit:
         raise GuardError("STALE_OBSERVATION")
     return result
 
@@ -230,12 +241,12 @@ def evaluate(view, actual, sample, now, proof=None):
         return {"phase": "activation-origin", "ledger_age": None, "native_age": None}
     if sample is None:
         raise GuardError("NATIVE_WARMING")
-    native_age = age(sample.at, now)
+    native_age = age(sample.at, now, GATE_AGE)
     if api_only:
         return {"phase": "api-only", "ledger_age": None, "native_age": native_age}
     if worker["observed_state"] != "running" or not user["trusted_sample"] or not domain.eligible(user, now):
         raise GuardError("UNTRUSTED_AUTHORIZATION_OR_METER")
-    ledger_age = age(user["last_sample_at"], now)
+    ledger_age = age(user["last_sample_at"], now, GATE_AGE)
     if not user["meter_epoch"] or sample.epoch != user["meter_epoch"]:
         raise GuardError("EPOCH_MISMATCH")
     if worker["credential_version"] != user["credential_version"] or worker["observed_generation"] != worker["root_ack_generation"]:
@@ -249,7 +260,7 @@ def run_guard(state_dir, policy, worker_id, *, stop=None, witness=None, runtime_
     stop, witness = stop or threading.Event(), witness or NativeWitness()
     runtime_probe = runtime_probe or RuntimeProbe()
     proof_reader = proof_reader or (lambda: read_proof(policy, worker_id))
-    announced, warming_deadline, identity = False, time.monotonic() + MAX_AGE, None
+    announced, identity = False, None
     try:
         # One persistent read-only connection. When the last other connection of
         # a WAL database closes, SQLite deletes -wal/-shm, and a read-only mount
@@ -270,8 +281,8 @@ def run_guard(state_dir, policy, worker_id, *, stop=None, witness=None, runtime_
                 try:
                     evidence = evaluate(view, actual, sample, now, proof)
                 except GuardError as exc:
-                    if not announced and exc.code == "NATIVE_WARMING" and time.monotonic() < warming_deadline:
-                        stop.wait(0.1)
+                    if not announced and exc.code in WAIT_CODES:
+                        stop.wait(0.1)  # The gate stays shut until a fresh trusted sample opens it.
                         continue
                     raise
                 key = (actual["pid"], view["worker"]["observed_generation"])
@@ -305,8 +316,10 @@ def main(argv=None):
     try:
         run_guard(args.state_dir, load_policy(args.policy), args.worker_id, stop=stopped)
         return 0
+    except GuardError as exc:
+        return EXIT_GATE if exc.code in WAIT_CODES else EXIT_FATAL
     except Exception:
-        return 1  # Guard failure is local to its BindsTo member; no sensitive logs.
+        return EXIT_GATE  # Unknown faults close the gate and retry; they never stop the Core. No sensitive logs.
 
 
 if __name__ == "__main__":

@@ -1,7 +1,9 @@
 [Unit]
-Description=Dazzle independent verified meter guard for member %i
+Description=Dazzle independent verified meter guard and network gate for member %i
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
 
 [Service]
 Environment=PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
@@ -11,9 +13,17 @@ User=dazzle-agent
 Group=dazzle-agent
 SupplementaryGroups=dazzle-vps
 ExecStart=/opt/dazzle-vps/releases/@RELEASE_ID@/venv/bin/python -I -m dazzle.meter_guard --policy /etc/dazzle-vps/policy.json --state-dir /var/lib/dazzle-vps --worker-id %i
-Restart=no
+# Root, outside the sandbox below: READY opens the member's network gate and every
+# exit closes it again. If the gate module itself fails, a gated Core is stopped.
+ExecStartPost=+/opt/dazzle-vps/releases/@RELEASE_ID@/venv/bin/python -I -m deployment.member_gate open %i
+ExecStopPost=+/bin/sh -c '/opt/dazzle-vps/releases/@RELEASE_ID@/venv/bin/python -I -m deployment.member_gate close %i || { { [ -e /etc/systemd/system/dazzle-proxy@%i.service.d/40-dazzle-member-gate.conf ] || grep -qx IPAddressDeny=any /etc/systemd/system/dazzle-proxy@.service; } && /usr/bin/systemctl stop --no-block dazzle-proxy@%i.service; }'
+Restart=on-failure
+RestartSec=1
+RestartPreventExitStatus=3
 WatchdogSec=5
-TimeoutStartSec=10
+# A stale meter keeps the guard waiting before READY, with its member's gate shut. The bound
+# keeps a member start queued behind a waiting guard from hanging; it proceeds gated.
+TimeoutStartSec=60
 TimeoutStopSec=5
 UMask=0077
 NoNewPrivileges=yes

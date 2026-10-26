@@ -18,6 +18,7 @@ from deployment.installer import canonical, sha256
 
 ROOT = Path(__file__).resolve().parents[1]
 UTC = dt.timezone.utc
+GATE_AGE = 4.0  # dazzle.meter_guard.GATE_AGE: a guard closes its member's gate beyond this sample age
 
 
 class FakeLedger:
@@ -110,6 +111,7 @@ class World:
         self.old_stop_delay, self.old_cold_start, self.standby_warming = 0.3, 1.5, False
         self.standby_ready_at, self.reloads, self.hooks = None, 0, {}
         self.certsync_outcome, self.certsync_runs = None, []  # None: no certificate sync unit installed
+        self.runtime_gate = {}  # unit -> "open"/"closed", as `systemctl set-property --runtime` leaves it
 
     def install_certsync(self, outcome):
         self.certsync_outcome = outcome
@@ -119,7 +121,44 @@ class World:
     def unit(self, kind, pid, *, fragment="", binds_to=None, after=None, file_state="static", exec_start_us=0, active_enter_us=0):
         return {"kind": kind, "load": "loaded", "active": "active", "sub": "running", "pid": pid, "invocation": "inv-" + str(pid),
                 "restarts": 0, "fragment": fragment, "dropins": "", "binds_to": binds_to or [], "after": after or ["network-online.target"],
-                "status": "", "file_state": file_state, "exec_start_us": exec_start_us, "active_enter_us": active_enter_us}
+                "wants": ["network-online.target"], "status": "", "file_state": file_state, "exec_start_us": exec_start_us,
+                "active_enter_us": active_enter_us}
+
+    # Member network gate, as systemd evaluates it ----------------------
+    def gate_dropin(self, name):
+        return "/etc/systemd/system/" + name + ".d/40-dazzle-member-gate.conf"
+
+    def gated(self, name):
+        unit = self.units[name]
+        if unit["fragment"] == "/etc/systemd/system/dazzle-proxy@.service":
+            return b"\nIPAddressDeny=any\n" in self.files["/etc/systemd/system/dazzle-proxy@.service"]
+        return self.gate_dropin(name) in self.files
+
+    def gate_closed(self, name):
+        state = self.runtime_gate.get(name)
+        return state == "closed" if state else self.gated(name)
+
+    def set_gate(self, name, state):
+        self.runtime_gate[name] = state
+        header = "# This is a drop-in unit file extension, created via \"systemctl set-property\"\n# or an equivalent operation. Do not edit.\n"
+        for key, closed in (("IPAddressDeny", "any"), ("IPAddressAllow", "localhost")):
+            value = closed if state == "closed" else ""
+            self.files["/run/systemd/system.control/" + name + ".d/50-" + key + ".conf"] = (header + "[Service]\n" + key + "=" + value + "\n").encode()
+
+    def guard_exit(self, fatal):
+        """ExecStopPost: a gated member is closed, or stopped on the guard's fatal exit."""
+        member = self.member_unit
+        if self.gated(member):
+            if fatal:
+                self.exit(member)
+            else:
+                self.set_gate(member, "closed")
+
+    def guard_ready(self):
+        self.units[self.guard].update(active="active", sub="running", pid=self.pid(),
+                                      status="member-guard-ready; worker=%s; phase=running" % self.member)
+        if self.gated(self.member_unit):
+            self.set_gate(self.member_unit, "open")  # ExecStartPost
 
     @staticmethod
     def exec_line(unit_bytes):
@@ -199,10 +238,17 @@ class World:
                 self.at(self.takeover_delay, self.take_over)
         guard = self.units.get(self.guard)
         member = self.units[self.member_unit]
-        if guard and guard["active"] == "active":
+        if guard and guard["active"] in {"active", "activating"}:
             age = (self.wall() - dt.datetime.fromisoformat(self.users[self.member]["last_sample_at"])).total_seconds()
-            if member["pid"] != 4300 or age > FRESHNESS_LIMIT:
+            if member["pid"] != 4300:
+                self.exit(self.guard, "failed")
+                self.guard_exit(fatal=True)
+            elif guard["active"] == "active" and age > GATE_AGE:
                 self.exit(self.guard)
+                self.guard_exit(fatal=False)
+                guard.update(active="activating", sub="auto-restart", restarts=guard["restarts"] + 1)
+            elif guard["active"] == "activating" and age <= GATE_AGE:
+                self.guard_ready()
         if member["active"] == "active" and any(self.units.get(name, {"active": "inactive"})["active"] in {"inactive", "failed", "deactivating"}
                                                for name in member["binds_to"]):
             self.exit(self.member_unit)
@@ -240,10 +286,11 @@ class World:
             self.standby_ready_at = self.time + self.standby_delay
         elif verb == "start" and name == self.guard:
             age = (self.wall() - dt.datetime.fromisoformat(self.users[self.member]["last_sample_at"])).total_seconds()
-            healthy = self.units[self.member_unit]["pid"] == 4300 and age <= FRESHNESS_LIMIT
-            self.units[self.guard] = dict(self.unit("guard", self.pid() if healthy else 0),
-                                          status="member-guard-ready; worker=%s; phase=running" % self.member if healthy else "",
-                                          active="active" if healthy else "failed")
+            self.units[self.guard] = dict(self.unit("guard", 0), active="activating", sub="start")  # waits before READY
+            if self.units[self.member_unit]["pid"] == 4300 and age <= GATE_AGE:
+                self.guard_ready()
+        elif verb == "set-property" and name in self.units:
+            self.set_gate(name, "closed" if "IPAddressDeny=any" in arguments else "open")
         elif verb == "start" and name == self.w1:
             unit = self.units[self.w1]
             unit.update(active="activating", sub="start", pid=self.pid(), invocation="inv-fallback")
@@ -284,7 +331,8 @@ class World:
                 source = self.files.get(path) or self.files["/etc/systemd/system/dazzle-proxy@.service"]
                 unit["fragment"] = path if path in self.files else "/etc/systemd/system/dazzle-proxy@.service"
                 lines = source.decode().splitlines()
-                unit["binds_to"] = next(line for line in lines if line.startswith("BindsTo=")).split("=", 1)[1].split()
+                unit["binds_to"] = next((line for line in lines if line.startswith("BindsTo=")), "BindsTo=").split("=", 1)[1].split()
+                unit["wants"] = next((line for line in lines if line.startswith("Wants=")), "Wants=").split("=", 1)[1].split()
                 unit["after"] = next(line for line in lines if line.startswith("After=")).split("=", 1)[1].split()
         self.exec_start[self.w1] = self.exec_line(self.files["/etc/systemd/system/dazzle-vps-agent.service"])
 
@@ -295,13 +343,19 @@ class World:
                       name.startswith("dazzle-vps-meter-guard@") and "/etc/systemd/system/dazzle-vps-meter-guard@.service" in self.files)
             unit = self.unit("absent", 0)
             unit.update(load="loaded" if loaded else "not-found", active="inactive", sub="dead")
+        dropins = unit["dropins"]
+        if unit["kind"] == "member":
+            dropins = " ".join([path for path in [self.gate_dropin(name)] if path in self.files] +
+                               sorted(path for path in self.files if path.startswith("/run/systemd/system.control/" + name + ".d/")))
+        gate = {"Wants": " ".join(unit["wants"]), "IPAddressDeny": "::/0 0.0.0.0/0" if unit["kind"] == "member" and self.gate_closed(name) else "",
+                "ControlGroup": unit.get("cgroup", "/system.slice/" + name) if unit["pid"] else ""}
         values = {"LoadState": unit["load"], "ActiveState": unit["active"], "SubState": unit["sub"], "MainPID": str(unit["pid"]),
                   "NRestarts": str(unit["restarts"]), "InvocationID": unit["invocation"] if unit["pid"] else "",
-                  "FragmentPath": unit["fragment"], "DropInPaths": unit["dropins"], "BindsTo": " ".join(unit["binds_to"]),
+                  "FragmentPath": unit["fragment"], "DropInPaths": dropins, "BindsTo": " ".join(unit["binds_to"]),
                   "After": " ".join(unit["after"]), "StatusText": unit["status"], "UnitFileState": unit["file_state"],
                   "NeedDaemonReload": "no", "ExecMainStartTimestampMonotonic": str(unit["exec_start_us"]),
                   "ActiveEnterTimestampMonotonic": str(unit["active_enter_us"]), "ExecStart": self.exec_start.get(name, ""),
-                  "Result": unit.get("result", "")}
+                  "Result": unit.get("result", ""), **gate}
         return {key: values[key] for key in properties}
 
     def facts(self):
@@ -537,16 +591,18 @@ class CoordinatorTests(unittest.TestCase):
     def assert_never_restarted_a_core(self):
         for call in self.world.calls:
             self.assertNotIn("restart", call)
-            self.assertNotIn(self.world.member_unit, call)
             self.assertNotIn(self.world.admin_unit, call)
+            if self.world.member_unit in call:  # Only its network gate is ever set.
+                self.assertEqual(call[:3], ("set-property", "--runtime", self.world.member_unit))
         self.assertEqual(self.world.files["/usr/local/bin/dazzle-vps-control"], LAUNCHER)
 
     def assert_original_layout(self):
         self.assertEqual(self.world.current, self.world.old_release)
         self.assertEqual(self.world.files["/etc/systemd/system/dazzle-vps-agent.service"], (ROOT / "systemd/dazzle-vps-agent.service").read_bytes())
         for path in ("/etc/systemd/system/" + self.world.member_unit, "/etc/systemd/system/dazzle-vps-meter-guard@.service",
-                     "/etc/systemd/system/dazzle-vps-writer@.service", str(self.layout.snapshot)):
+                     "/etc/systemd/system/dazzle-vps-writer@.service", str(self.layout.snapshot), self.world.gate_dropin(self.world.member_unit)):
             self.assertNotIn(path, self.world.files)
+        self.assertFalse(self.world.gate_closed(self.world.member_unit))
         self.assertEqual(self.world.units[self.world.member_unit]["binds_to"], [self.world.w1])
 
     def test_preview_is_read_only_and_reports_exact_rendered_changes(self):
@@ -557,7 +613,15 @@ class CoordinatorTests(unittest.TestCase):
         self.assertTrue(plan["ready_for_approval"], plan["issues"])
         files = plan["reviewed"]["files"]
         self.assertEqual(files["/etc/systemd/system/" + self.world.member_unit]["phase"], "adopt")
-        self.assertIn("BindsTo=" + self.world.guard, files["/etc/systemd/system/" + self.world.member_unit]["content"])
+        member = files["/etc/systemd/system/" + self.world.member_unit]["content"]
+        self.assertNotIn("BindsTo=", member)  # Bound to nothing: a restarting guard closes the gate instead.
+        self.assertIn("\nWants=network-online.target " + self.world.guard + "\n", member)
+        self.assertIn("\nAfter=network-online.target " + self.world.guard + "\n", member)
+        gate = files[self.world.gate_dropin(self.world.member_unit)]
+        self.assertEqual((gate["phase"], gate["before_sha256"], gate["content"]),
+                         ("adopt", None, "[Service]\nIPAddressAllow=localhost\nIPAddressDeny=any\n"))
+        guard = files["/etc/systemd/system/dazzle-vps-meter-guard@.service"]["content"]
+        self.assertIn("ExecStartPost=+/opt/dazzle-vps/releases/" + self.world.new_release + "/venv/bin/python -I -m deployment.member_gate open %i\n", guard)
         fallback = files["/etc/systemd/system/dazzle-vps-agent.service"]["content"]
         self.assertIn("/opt/dazzle-vps/releases/" + self.world.old_release + "/venv/bin/python", fallback)
         self.assertIn("previous-policy-v1.json", fallback)
@@ -572,7 +636,10 @@ class CoordinatorTests(unittest.TestCase):
         self.assertEqual(result["status"], "handoff_complete", result)
         world = self.world
         self.assertEqual((world.units[world.member_unit]["pid"], world.units[world.admin_unit]["pid"]), (4300, 4200))
-        self.assertEqual(world.units[world.member_unit]["binds_to"], [world.guard])
+        self.assertEqual(world.units[world.member_unit]["binds_to"], [])
+        self.assertIn(world.guard, world.units[world.member_unit]["wants"])
+        self.assertTrue(world.gated(world.member_unit))
+        self.assertFalse(world.gate_closed(world.member_unit))
         self.assertEqual(world.lock_holder, world.units[world.w2]["pid"])
         self.assertEqual((world.units[world.w1]["pid"], world.units[world.w1]["file_state"], world.units[world.w2]["file_state"]), (0, "disabled", "enabled"))
         self.assertEqual(world.current, world.new_release)
@@ -587,6 +654,39 @@ class CoordinatorTests(unittest.TestCase):
         self.assert_never_restarted_a_core()
         order = [call[0] for call in world.calls if call[0] in {"stop", "start"} and (world.w1 in call or world.w2 in call or world.guard in call)]
         self.assertEqual(order, ["start", "start", "stop"])  # guard, standby, then the original writer only.
+
+    def test_after_the_handoff_a_writer_stall_closes_the_gate_and_keeps_the_core(self):
+        result = self.run_coordinator()
+        self.assertEqual(result["status"], "handoff_complete", result)
+        world, writer = self.world, self.world.units[self.world.w2]["pid"]
+        world.persisting.discard(writer)  # e.g. the VM was paused: no sample is persisted
+        world.advance(GATE_AGE + 1.0)
+        self.assertTrue(world.gate_closed(world.member_unit))
+        self.assertEqual((world.units[world.member_unit]["pid"], world.units[world.member_unit]["active"]), (4300, "active"))
+        self.assertEqual(world.units[world.guard]["active"], "activating")  # restarted, waiting before READY
+        world.start_writer(writer, seed=False, first=0.0)
+        world.advance(2.0)
+        self.assertFalse(world.gate_closed(world.member_unit))
+        self.assertEqual((world.units[world.member_unit]["pid"], world.units[world.guard]["active"]), (4300, "active"))
+        self.assert_never_restarted_a_core()
+
+    def test_a_gate_closed_at_adoption_aborts_and_the_revert_reopens_it(self):
+        self.world.hooks[2] = lambda: self.world.set_gate(self.world.member_unit, "closed")  # the adoption reload
+        result = self.run_coordinator()
+        self.assertEqual(result["status"], "aborted_no_core_or_writer_changed", result)
+        self.assertIn("gate transfer", result["abort_reason"])
+        self.assert_original_layout()
+        self.assert_never_restarted_a_core()
+
+    def test_a_member_in_a_nested_slice_is_not_approvable(self):
+        self.world.units[self.world.member_unit]["cgroup"] = "/system.slice/system-dazzle\\x2dproxy.slice/" + self.world.member_unit
+        self.assertIn("MEMBER_SLICE", {issue["code"] for issue in self.plan()["issues"]})
+
+    def test_empty_runtime_resets_from_a_revert_allow_a_retry_but_a_closed_gate_does_not(self):
+        self.world.set_gate(self.world.member_unit, "open")
+        self.assertTrue(self.plan()["ready_for_approval"])
+        self.world.set_gate(self.world.member_unit, "closed")
+        self.assertIn("MEMBER_UNIT", {issue["code"] for issue in self.plan()["issues"]})
 
     def test_installed_certificate_sync_is_proven_once_on_the_new_release(self):
         self.world.install_certsync("success")
@@ -725,12 +825,17 @@ class CoordinatorTests(unittest.TestCase):
         self.assert_never_restarted_a_core()
         self.assertEqual(world.incidents, 2)
 
-    def test_hung_takeover_with_slow_fallback_is_reported_as_member_interruption(self):
+    def test_hung_takeover_with_slow_fallback_pauses_member_traffic_but_keeps_its_core(self):
         self.world.takeover_mode, self.world.old_cold_start = "hang", 4.5
         result = self.run_coordinator()
-        self.assertEqual(result["status"], "fallback_complete_members_interrupted", result)
+        # Its samples aged past the gate limit: the guard closed the gate, then reopened it once
+        # the old writer sampled again. The Core never stopped.
+        self.assertEqual(result["status"], "fallback_complete_members_preserved", result)
         self.assertFalse(result["fallback"]["within_sample_deadline"])
-        self.assertEqual(result["fallback"]["members_interrupted"], 1)
+        self.assertEqual((result["fallback"]["members_interrupted"], result["fallback"]["members_traffic_paused"]), (0, 1))
+        self.assertEqual(self.world.units[self.world.member_unit]["pid"], 4300)
+        self.assertFalse(self.world.gate_closed(self.world.member_unit))
+        self.assert_original_layout()
         self.assertEqual(self.world.current, self.world.old_release)
         self.assertEqual(self.world.files["/usr/local/bin/dazzle-vps-control"], LAUNCHER)
 

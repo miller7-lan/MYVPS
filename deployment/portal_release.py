@@ -20,7 +20,7 @@ from .release import LICENSE_FILES, PROTOBUF_VERSION, source_files, validate_whe
 
 REQUIRED_PACKAGES = frozenset({"protobuf", "starlette", "uvicorn", "anyio", "click", "h11", "idna", "typing-extensions", "qrcode"})
 OPTIONAL_PACKAGES = frozenset({"sniffio"})
-PORTAL_TOOLS = ("portal_release.py", "portal_upgrade.py", "handoff.py", "coordinator.py")
+PORTAL_TOOLS = ("portal_release.py", "portal_upgrade.py", "handoff.py", "coordinator.py", "member_gate.py")
 STATIC_FILES = ("index.html", "app.css", "app.js")
 TEMPLATES = ("subscription.service", "agent.conf", "certsync.conf", "tmpfiles.conf", "writer@.service", "meter-guard@.service", "guarded-member.service", "managed-certsync.conf")
 

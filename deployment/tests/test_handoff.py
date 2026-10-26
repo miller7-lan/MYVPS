@@ -20,18 +20,20 @@ class HandoffReviewTests(unittest.TestCase):
     def test_complete_override_changes_only_dependencies_and_preserves_execution_limits(self):
         result=handoff.render_existing_member(self.member,self.identifier)
         self.assertEqual(self.member.split('[Service]',1)[1],result.split('[Service]',1)[1])
-        self.assertIn('BindsTo='+handoff.guard_name(self.identifier),result)
+        self.assertNotIn('BindsTo=',result)
+        self.assertIn('\nWants=network-online.target '+handoff.guard_name(self.identifier)+'\n',result)
+        self.assertIn('\nAfter=network-online.target '+handoff.guard_name(self.identifier)+'\n',result)
         self.assertNotIn(handoff.OLD_WRITER,result)
-        self.assertNotIn('BindsTo=\n',result)
 
     def test_unknown_member_dependency_or_non_uuid_cannot_be_retargeted(self):
         with self.assertRaises(ValueError):handoff.render_existing_member(self.member.replace(handoff.OLD_WRITER,'unknown.service'),self.identifier)
         with self.assertRaises(Exception):handoff.render_existing_member(self.member,'../other')
 
     def test_pid_restart_count_and_actual_bindings_must_all_remain_proven(self):
-        correct=dict(self.before,binds_to=[handoff.guard_name(self.identifier)])
+        correct=dict(self.before,binds_to=[],wants=['network-online.target',handoff.guard_name(self.identifier)])
         handoff.verify_member_observation(self.before,correct,self.identifier)
-        for changed in ({'pid':102},{'restarts':1},{'active_state':'inactive'}, {'binds_to':[handoff.OLD_WRITER,handoff.guard_name(self.identifier)]}):
+        for changed in ({'pid':102},{'restarts':1},{'active_state':'inactive'},{'binds_to':[handoff.OLD_WRITER]},
+                        {'binds_to':[handoff.guard_name(self.identifier)]},{'wants':['network-online.target']}):
             with self.subTest(changed=changed),self.assertRaises(ValueError):handoff.verify_member_observation(self.before,correct|changed,self.identifier)
 
     def test_old_writer_fallback_pins_immutable_source_and_v1_snapshot(self):

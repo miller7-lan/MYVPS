@@ -74,9 +74,16 @@ def directory(path, mode, uid=0, gid=0):
     os.chmod(path, mode)
 
 
+def external_address():
+    """This host's own non-loopback IPv4: unlike 127.0.0.1, a closed member gate filters it."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect(("192.0.2.1", 9))  # TEST-NET-1; connect() on UDP only picks the outbound address
+        return probe.getsockname()[0]
+
+
 class LongClient:
-    def __init__(self, port):
-        self.connection = socket.create_connection(("127.0.0.1", port), timeout=2)
+    def __init__(self, port, host="127.0.0.1"):
+        self.connection = socket.create_connection((host, port), timeout=2)
         self.connection.settimeout(2)
         self.reader = self.connection.makefile("rb")
         self.stopped, self.error, self.count, self.pids = threading.Event(), None, 0, set()
@@ -266,6 +273,8 @@ class Rehearsal:
             assert bound == ["dazzle-vps-agent.service"] and current.endswith(self.old_release)
             assert "/opt/dazzle-vps/current/venv/bin/python" in old["ExecStart"]
             assert not Path("/etc/systemd/system/" + member).exists() and not Path("/etc/systemd/system/dazzle-vps-writer@.service").exists()
+            assert not Path("/etc/systemd/system/" + member + ".d/40-dazzle-member-gate.conf").exists()
+            assert show(member, "IPAddressDeny")["IPAddressDeny"] == "", "a reverted member was left gated"
             assert show("dazzle-vps-meter-guard@" + self.member + ".service", "ActiveState")["ActiveState"] in {"inactive", "failed"}
             assert "takeover" not in result
             return {"status": result["status"], "core_pids_preserved": True, "member_tcp_session_preserved": True,
@@ -273,7 +282,10 @@ class Rehearsal:
         if self.scenario == "success":
             assert result["status"] == "handoff_complete", result
             assert (old["ActiveState"], old["UnitFileState"], new["ActiveState"], new["UnitFileState"]) == ("inactive", "disabled", "active", "enabled")
-            assert bound == ["dazzle-vps-meter-guard@" + self.member + ".service"]
+            guard = "dazzle-vps-meter-guard@" + self.member + ".service"
+            assert bound == [] and guard in show(member, "Wants")["Wants"].split(), "a member is still bound or not owned by its guard"
+            assert Path("/etc/systemd/system/" + member + ".d/40-dazzle-member-gate.conf").read_bytes() == b"[Service]\nIPAddressAllow=localhost\nIPAddressDeny=any\n"
+            assert show(member, "IPAddressDeny")["IPAddressDeny"] == "", "the member gate is not open after the handoff"
             assert current.endswith(self.new_release)
             assert (" " + new["MainPID"] + " ") in locks and "FLOCK" in locks
             assert Path("/etc/systemd/system/dazzle-proxy@.service").read_bytes() == (REPOSITORY / "deployment/portal-systemd/guarded-member.service").read_bytes()
@@ -281,6 +293,8 @@ class Rehearsal:
         else:
             assert result["status"] == "fallback_complete_members_preserved", result
             assert result["fallback"]["within_sample_deadline"] is True
+            assert bound == ["dazzle-vps-agent.service"] and show(member, "IPAddressDeny")["IPAddressDeny"] == ""
+            assert not Path("/etc/systemd/system/" + member + ".d/40-dazzle-member-gate.conf").exists()
             assert old["ActiveState"] == "active" and old["UnitFileState"] == "enabled" and new["ActiveState"] in {"inactive", "failed"}
             assert bound == ["dazzle-vps-agent.service"] and current.endswith(self.old_release)
             assert "/opt/dazzle-vps/current/venv/bin/python" in old["ExecStart"]  # Original definition restored.
@@ -289,22 +303,29 @@ class Rehearsal:
         timings = result.get("takeover", {}).get("timings", {})
         fail_closed = None
         if self.scenario == "success":
-            # A crash restarts the writer as a standby (Restart=on-failure, 3s). Whether it re-takes the lock
-            # inside the unchanged five-second window is only observed here; it is never relied upon.
-            run("/usr/bin/systemctl", "kill", "--signal=SIGKILL", "--kill-whom=main", writer)
-            time.sleep(6.5)
-            crash = {"member_survived": show(member, "MainPID")["MainPID"] == self.before["member"]["MainPID"],
-                     "gap_incidents": self.facts()["incidents_total"]}
-            # Protection stays on after the handoff: with no writer at all the guard stops the member, never the admin.
+            # Protection stays on after the handoff. With no writer, the guard closes its member's gate inside
+            # the unchanged five seconds: public traffic stops, the Core keeps its process, the admin is untouched.
+            gate = lambda: show(member, "IPAddressDeny")["IPAddressDeny"]
+            public = LongClient(24431, host=external_address())
+            wait_for(lambda: public.count > 3, message="member session over the public address")
             run("/usr/bin/systemctl", "stop", writer)
             began = time.monotonic()
-            wait_for(lambda: show(member, "ActiveState")["ActiveState"] in {"inactive", "failed"}, timeout=12, message="fail-closed member stop")
+            wait_for(lambda: bool(gate()), timeout=12, message="fail-closed member gate")
+            closed_after = round(time.monotonic() - began, 2)
+            # The ledger was at most ~1s old; the gate closes past 4 s, inside the unchanged 5 s, not early.
+            assert 2.5 <= closed_after <= 5.5, closed_after
+            assert show(member, "MainPID", "InvocationID", "NRestarts") == self.before["member"], "the gate stopped the Core"
             assert show(admin, "MainPID", "InvocationID", "NRestarts") == self.before["admin"]
-            stopped_after = round(time.monotonic() - began, 2)
-            # The ledger was at most ~1s old; the guard must use the whole unchanged window, not fail early or late.
-            assert 3.0 <= stopped_after <= 6.5, stopped_after
-            fail_closed = {"member_stopped_after_writer_stop_seconds": stopped_after, "administrator_unaffected": True,
-                           "observed_writer_crash_with_automatic_restart": crash}
+            frozen = public.count; time.sleep(1.5)
+            assert public.count == frozen, "public member traffic passed a closed gate"
+            public.stopped.set()
+            # A writer back after more than five seconds finds a gap: the strict rule still requires a
+            # reconciliation, so the gate stays shut although the Core and its counters survived. Observed only.
+            run("/usr/bin/systemctl", "start", "--no-block", writer)
+            time.sleep(8)
+            fail_closed = {"member_gate_closed_after_writer_stop_seconds": closed_after, "member_core_kept": True,
+                           "public_traffic_stopped": True, "administrator_unaffected": True,
+                           "gate_reopened_after_long_writer_outage": not gate(), "gap_incidents": self.facts()["incidents_total"]}
         return {"status": result["status"], "core_pids_preserved": True, "member_tcp_session_preserved": True, "fail_closed_after_handoff": fail_closed,
                 "max_ledger_age_at_stop": result["takeover"]["max_ledger_age_at_stop"], "timings": timings,
                 "fallback": result.get("fallback"), "measured_fallback_reserve": plan["measurements"]["fallback_reserve_seconds"]}
@@ -327,6 +348,10 @@ class Rehearsal:
         for path in Path("/etc/systemd/system").glob("dazzle-*"):
             if path.is_file() or path.is_symlink():
                 path.unlink()
+            elif path.is_dir():  # a member's gate drop-in directory
+                shutil.rmtree(path)
+        for path in Path("/run/systemd/system.control").glob("dazzle-*"):  # runtime gate resets
+            shutil.rmtree(path)
         for path in OWNED_PATHS:
             path = Path(path)
             if path.is_symlink() or path.is_file():

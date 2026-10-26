@@ -80,29 +80,36 @@ def guard_name(identifier):
 
 
 def render_existing_member(original, identifier):
-    """Complete instance override: change only BindsTo/After in known source.
+    """Complete instance override: change only the [Unit] dependencies in known source.
 
-    Dependencies cannot be cleared in a drop-in. Unknown dependency drop-ins are
-    rejected separately instead of pretending an empty BindsTo resets them.
+    The member stops being bound to any unit. BindsTo= on the old writer is dropped;
+    the guard joins Wants= and replaces the writer in After=. A guard that exits now
+    closes the member's network gate instead of stopping its Core (the gate drop-in
+    is a separate reviewed file). Dependencies cannot be cleared in a drop-in; unknown
+    dependency drop-ins are rejected separately.
     """
     identifier = canonical_uuid(identifier)
+    guard = guard_name(identifier)
     source = original.decode("utf-8") if isinstance(original, bytes) else original
-    lines = source.splitlines(keepends=True); section = None; bound = 0; ordered = 0; result = []
+    lines = source.splitlines(keepends=True); section = None; bound = ordered = wanted = 0; result = []
     for line in lines:
         stripped = line.strip()
         if stripped.startswith('[') and stripped.endswith(']'): section = stripped
         if section == '[Unit]' and stripped.startswith('BindsTo='):
-            values = stripped.split('=', 1)[1].split()
-            if OLD_WRITER not in values: raise ValueError("Original member dependency differs from reviewed binding")
-            values = [guard_name(identifier) if value == OLD_WRITER else value for value in values]
-            line = 'BindsTo=' + ' '.join(dict.fromkeys(values)) + '\n'; bound += 1
+            if stripped.split('=', 1)[1].split() != [OLD_WRITER]:
+                raise ValueError("Original member dependency differs from reviewed binding")
+            bound += 1
+            continue
+        if section == '[Unit]' and stripped.startswith('Wants='):
+            values = stripped.split('=', 1)[1].split() + [guard]
+            line = 'Wants=' + ' '.join(dict.fromkeys(values)) + '\n'; wanted += 1
         elif section == '[Unit]' and stripped.startswith('After='):
             values = stripped.split('=', 1)[1].split()
-            values = [guard_name(identifier) if value == OLD_WRITER else value for value in values]
-            if guard_name(identifier) not in values: values.append(guard_name(identifier))
+            values = [guard if value == OLD_WRITER else value for value in values]
+            if guard not in values: values.append(guard)
             line = 'After=' + ' '.join(dict.fromkeys(values)) + '\n'; ordered += 1
         result.append(line)
-    if bound != 1 or ordered != 1 or '[Service]' not in source:
+    if bound != 1 or ordered != 1 or wanted != 1 or '[Service]' not in source:
         raise ValueError("Expected one complete reviewed member unit")
     rendered = ''.join(result)
     if source.split('[Service]', 1)[1] != rendered.split('[Service]', 1)[1]:
@@ -114,7 +121,8 @@ def verify_member_observation(before, after, identifier):
     if before.get("pid", 0) <= 0 or before.get("active_state") != 'active': raise ValueError("Member was not running")
     if after.get("pid") != before["pid"] or after.get("active_state") != 'active' or after.get("restarts") != before["restarts"]:
         raise ValueError("Member core changed during dependency adoption")
-    if OLD_WRITER in after.get('binds_to', []) or guard_name(identifier) not in after.get('binds_to', []):
+    # Bound to nothing: its guard is wanted, and a guard exit closes the gate instead of stopping the Core.
+    if after.get('binds_to') or guard_name(identifier) not in after.get('wants', []):
         raise ValueError("Actual systemd dependency was not migrated")
 
 

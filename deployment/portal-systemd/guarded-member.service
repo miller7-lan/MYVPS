@@ -1,12 +1,15 @@
 [Unit]
 Description=Dazzle independently guarded member proxy %i
-BindsTo=dazzle-vps-meter-guard@%i.service
+# Not bound to the guard: a restarting guard closes the network gate instead of stopping the Core.
+Wants=network-online.target dazzle-vps-meter-guard@%i.service
 After=network-online.target dazzle-vps-meter-guard@%i.service
-Wants=network-online.target
 
 [Service]
 Type=exec
 Slice=system.slice
+# Closed until the guard opens it at runtime; reboots start closed again.
+IPAddressAllow=localhost
+IPAddressDeny=any
 User=dazzle-proxy
 Group=dazzle-proxy
 SupplementaryGroups=dazzle-vps

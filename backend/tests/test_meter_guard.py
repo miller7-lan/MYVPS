@@ -11,7 +11,10 @@ import time
 import unittest
 import uuid
 
-from dazzle.meter_guard import GuardError, NativeWitness, RuntimeProbe, evaluate, read_proof, run_guard
+from unittest.mock import patch
+
+from dazzle import meter_guard
+from dazzle.meter_guard import EXIT_FATAL, EXIT_GATE, GuardError, NativeWitness, RuntimeProbe, evaluate, read_proof, run_guard
 from dazzle.metering import MeterSample, NativeAPI
 from dazzle.production_state import CORE_SHA256, ProductionStore
 from dazzle.store import timestamp, utcnow
@@ -52,6 +55,15 @@ class GuardDecisionTests(unittest.TestCase):
         with self.assertRaisesRegex(GuardError,"PID_MISMATCH"):evaluate(self.view,{"pid":124},self.sample,self.now)
         with self.assertRaisesRegex(GuardError,"EPOCH_MISMATCH"):evaluate(self.view,self.actual,MeterSample("other",0,0,timestamp(self.now)),self.now)
         with self.assertRaises(GuardError):evaluate(self.view,self.actual,MeterSample(str(EPOCH),0,0,timestamp(self.now-dt.timedelta(seconds=5.01))),self.now)
+
+    def test_samples_close_the_gate_at_four_seconds_inside_the_unchanged_five(self):
+        old=lambda seconds:timestamp(self.now-dt.timedelta(seconds=seconds))
+        self.assertEqual(evaluate(self.view,self.actual,MeterSample(str(EPOCH),0,0,old(3.9)),self.now)["phase"],"running")
+        with self.assertRaisesRegex(GuardError,"STALE_OBSERVATION"):
+            evaluate(self.view,self.actual,MeterSample(str(EPOCH),0,0,old(4.01)),self.now)
+        view=copy.deepcopy(self.view);view["user"]["last_sample_at"]=old(4.01)
+        with self.assertRaisesRegex(GuardError,"STALE_OBSERVATION"):evaluate(view,self.actual,self.sample,self.now)
+        self.assertEqual(meter_guard.MAX_AGE,5.0)
 
     def test_never_started_ready_has_no_proxy_or_meter_privilege(self):
         for pid in (None,0):
@@ -211,8 +223,11 @@ class GuardLoopTests(unittest.TestCase):
             class FixedWitness:
                 def sample(inner,worker):return MeterSample(str(EPOCH),UPLOAD,DOWNLOAD,timestamp(utcnow()))
                 def close(inner):pass
-            with self.assertRaises(GuardError):
-                run_guard(folder,policy,member,witness=FixedWitness(),runtime_probe=lambda worker,pid:{"pid":pid,"identity":"123:1000"},proof_reader=lambda:None,ready=lambda _:None)
+            # A disabled member's guard keeps its gate shut: it waits and never announces READY.
+            held=threading.Event();announced=[]
+            threading.Timer(0.6,held.set).start()
+            run_guard(folder,policy,member,stop=held,witness=FixedWitness(),runtime_probe=lambda worker,pid:{"pid":pid,"identity":"123:1000"},proof_reader=lambda:None,ready=announced.append)
+            self.assertFalse([item for item in announced if item.startswith('READY=1')])
             stop=threading.Event();notifications=[]
             def receive(message):
                 notifications.append(message)
@@ -220,6 +235,57 @@ class GuardLoopTests(unittest.TestCase):
             run_guard(folder,policy,second,stop=stop,witness=FixedWitness(),runtime_probe=lambda worker,pid:{"pid":None,"identity":None},proof_reader=lambda:None,ready=receive)
             self.assertTrue(any(item.startswith('READY=1') for item in notifications))
             self.assertEqual(store.conn.execute("SELECT observed_state FROM production_workers WHERE worker_id=?",(second,)).fetchone()[0],'unprovisioned')
+
+    def test_a_stale_meter_before_ready_waits_and_opens_only_once_fresh(self):
+        from test_standby import running_fixture
+        with tempfile.TemporaryDirectory() as folder:
+            store,policy,member=running_fixture(folder);self.addCleanup(store.close)
+            calls=[]
+            class LateWitness:
+                def sample(inner,worker):
+                    calls.append(1)
+                    behind=4.5 if len(calls)<=3 else 0.0  # e.g. a writer or VM that has just resumed
+                    return MeterSample(str(EPOCH),UPLOAD,DOWNLOAD,timestamp(utcnow()-dt.timedelta(seconds=behind)))
+                def close(inner):pass
+            stop=threading.Event();notices=[]
+            def receive(message):
+                notices.append((len(calls),message))
+                if message=='WATCHDOG=1':stop.set()
+            run_guard(folder,policy,member,stop=stop,witness=LateWitness(),runtime_probe=lambda worker,pid:{"pid":pid,"identity":"123:1"},proof_reader=lambda:None,ready=receive)
+            ready=[count for count,message in notices if message.startswith('READY=1')]
+            self.assertEqual(ready,[4])  # Not before the first fresh native frame.
+
+    def test_a_stale_meter_after_ready_ends_the_guard_so_its_gate_closes(self):
+        from test_standby import running_fixture
+        with tempfile.TemporaryDirectory() as folder:
+            store,policy,member=running_fixture(folder);self.addCleanup(store.close)
+            calls=[]
+            class StallingWitness:
+                def sample(inner,worker):
+                    calls.append(1)
+                    behind=0.0 if len(calls)<=2 else 4.5
+                    return MeterSample(str(EPOCH),UPLOAD,DOWNLOAD,timestamp(utcnow()-dt.timedelta(seconds=behind)))
+                def close(inner):pass
+            notices=[]
+            with self.assertRaisesRegex(GuardError,"STALE_OBSERVATION"):
+                run_guard(folder,policy,member,witness=StallingWitness(),runtime_probe=lambda worker,pid:{"pid":pid,"identity":"123:1"},proof_reader=lambda:None,ready=notices.append)
+            self.assertTrue(any(item.startswith('READY=1') for item in notices))
+
+
+class GuardExitTests(unittest.TestCase):
+    def exit_for(self, effect):
+        with patch.object(meter_guard,"load_policy",return_value={}),patch.object(meter_guard,"run_guard",side_effect=effect):
+            return meter_guard.main(["--worker-id",str(uuid.uuid4())])
+
+    def test_stale_or_unknown_faults_close_the_gate_and_identity_faults_stop_the_core(self):
+        self.assertEqual(self.exit_for(GuardError("STALE_OBSERVATION")),EXIT_GATE)
+        self.assertEqual(self.exit_for(GuardError("UNTRUSTED_AUTHORIZATION_OR_METER")),EXIT_GATE)
+        self.assertEqual(self.exit_for(RuntimeError("database is locked")),EXIT_GATE)
+        for code in ("PID_MISMATCH","EPOCH_MISMATCH","AUTHORIZATION_REVOKED","ROOT_PROOF_PID_MISMATCH","PID_REUSED"):
+            with self.subTest(code=code):
+                self.assertEqual(self.exit_for(GuardError(code)),EXIT_FATAL)
+        self.assertEqual(self.exit_for(lambda *args,**kwargs:None),0)
+        self.assertEqual((EXIT_GATE,EXIT_FATAL),(75,3))  # Pinned by the unit's RestartPreventExitStatus=3.
 
 
 if __name__=='__main__':unittest.main()

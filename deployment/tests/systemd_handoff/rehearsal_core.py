@@ -41,7 +41,7 @@ def main():
         daemon_threads = True
         allow_reuse_address = True
 
-    servers = [Server(("127.0.0.1", config["public_port"]), Proxy), Server(("127.0.0.1", config["api_port"]), Api)]
+    servers = [Server(("0.0.0.0", config["public_port"]), Proxy), Server(("127.0.0.1", config["api_port"]), Api)]
     for server in servers:
         threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True).start()
     stopped.wait()
