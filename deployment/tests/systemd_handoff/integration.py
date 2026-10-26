@@ -58,6 +58,12 @@ class Scenario:
         self.root=Path('/run')/self.prefix;self.root.mkdir(mode=0o700)
         self.fixture=Path('/run')/(self.prefix+'-fixture.py')
         self.fixture.write_bytes(Path(__file__).with_name('fixture.py').read_bytes());self.fixture.chmod(0o755)
+        # Fixture copy of deployment.member_gate for prefixed units: only a gated Core is touched.
+        self.gate_script=Path('/run')/(self.prefix+'-gate.sh')
+        self.gate_script.write_text('#!/bin/sh\nunit=$2\ngrep -qx IPAddressDeny=any "/etc/systemd/system/$unit" 2>/dev/null || exit 0\n'
+            'if [ "$1" = open ]; then exec /usr/bin/systemctl set-property --runtime "$unit" IPAddressDeny= IPAddressAllow=; fi\n'
+            '/usr/bin/systemctl set-property --runtime "$unit" IPAddressDeny=any IPAddressAllow=localhost || /usr/bin/systemctl stop --no-block "$unit"\n')
+        self.gate_script.chmod(0o755)
         self.units={};self.clients={};self.extra_paths=[]
         self.old=self.prefix+'-old.service';self.new=self.prefix+'-new.service'
         self.identities={worker:str(uuid.uuid4()) for worker in ('a','b','c')}
@@ -84,7 +90,9 @@ class Scenario:
             old=render_existing_member(old,self.identities[worker])
             old=old.replace(guard_name(self.identities[worker]),self.name('guard',worker))
         header=old.split('[Service]',1)[0].replace(OLD_WRITER,self.old)
-        return header+self.service('core --root '+str(self.root)+' --worker %i',kind='exec')
+        # Directly in system.slice like the member template; a gated Core starts closed.
+        return (header+self.service('core --root '+str(self.root)+' --worker %i',kind='exec')+'Slice=system.slice\n'+
+                ('IPAddressAllow=localhost\nIPAddressDeny=any\n' if guarded else ''))
     def setup(self,*,fail=False):
         self.write_unit(self.old,'[Unit]\nDescription=fixture original exclusive writer\n'+self.service('writer --root '+str(self.root)+' --actor old',watchdog=10))
         self.write_unit(self.new,'[Unit]\nDescription=fixture read-only warmed candidate writer\n'+self.service('writer --root '+str(self.root)+' --actor new --standby'+(' --fail-acquire' if fail else ''),watchdog=10))
@@ -93,7 +101,9 @@ class Scenario:
             name=self.name('core',worker)
             if (Path('/etc/systemd/system')/name).exists():raise AssertionError('fixture instance collision')
             self.units[name]=None  # Initially loaded from the template, not a full instance file.
-            self.write_unit(self.name('guard',worker),'[Unit]\nDescription=fixture individual truthful counter guard\n'+self.service('guard --root '+str(self.root)+' --worker '+worker,watchdog=5)+'ProtectSystem=strict\nReadOnlyPaths='+str(self.root)+'\n')
+            core=self.name('core',worker)
+            self.write_unit(self.name('guard',worker),'[Unit]\nDescription=fixture individual truthful counter guard\n'+self.service('guard --root '+str(self.root)+' --worker '+worker,watchdog=5)+'ProtectSystem=strict\nReadOnlyPaths='+str(self.root)+'\n'
+                            'ExecStartPost=+/bin/sh '+str(self.gate_script)+' open '+core+'\nExecStopPost=+/bin/sh '+str(self.gate_script)+' close '+core+'\n')
         self.ctl('daemon-reload');self.ctl('start',self.old)
         for worker in ('a','b'):
             self.ctl('start',self.name('core',worker))
@@ -104,7 +114,7 @@ class Scenario:
         with sqlite3.connect('file:'+str(self.root/'ledger.sqlite3')+'?mode=ro',uri=True,timeout=.2) as db:
             return db.execute('SELECT pid,epoch,raw,used,sampled FROM counters WHERE worker=?',(worker,)).fetchone()
     def state(self,name):
-        result=self.ctl('show',name,'--property=ActiveState,MainPID,NRestarts,BindsTo')
+        result=self.ctl('show',name,'--property=ActiveState,MainPID,NRestarts,BindsTo,Wants,IPAddressDeny')
         return dict(line.split('=',1) for line in result.stdout.splitlines() if '=' in line)
     def prepare(self):
         for worker in ('a','b'):self.ctl('start',self.name('guard',worker))
@@ -117,14 +127,18 @@ class Scenario:
         assert self.state(self.name('guard','c'))['ActiveState']=='activating'
         assert self.old in self.state(self.name('core','b'))['BindsTo'].split()
         self.ctl('stop',self.name('guard','c'))
+    def gate(self,name):
+        return self.ctl('show',name,'--property=IPAddressDeny','--value').stdout.strip()
     def adopt(self):
         before={worker:self.state(self.name('core',worker)) for worker in ('a','b')}
+        # Open first: the default-closed unit that follows must not pause live traffic.
+        for worker in ('a','b'):self.ctl('set-property','--runtime',self.name('core',worker),'IPAddressDeny=','IPAddressAllow=')
         for worker in ('a','b'):self.write_unit(self.name('core',worker),self.core_text(worker,True))
         self.ctl('daemon-reload')
         for worker in ('a','b'):
             after=self.state(self.name('core',worker))
             assert after['MainPID']==before[worker]['MainPID'] and after['NRestarts']==before[worker]['NRestarts']
-            assert self.old not in after['BindsTo'].split() and self.name('guard',worker) in after['BindsTo'].split()
+            assert after['BindsTo']=='' and self.name('guard',worker) in after['Wants'].split() and after['IPAddressDeny']==''
         return before
     def assert_streams(self,before):
         for worker in ('a','b'):
@@ -141,19 +155,24 @@ class Scenario:
         with sqlite3.connect(self.root/'ledger.sqlite3') as db:
             assert [row[0] for row in db.execute('SELECT actor FROM writers ORDER BY seq')]==['old','new']
         # New API-only core can bootstrap a guard, then must show real fresh frames.
+        # As in production: the gated unit exists, its guard's READY opens it, then the Core starts.
         (self.root/'bootstrap-c.json').write_text(json.dumps({'api_only':True,'prepared':time.monotonic()}))
-        self.ctl('start',self.name('guard','c'));self.write_unit(self.name('core','c'),self.core_text('c',True));self.ctl('daemon-reload')
+        self.write_unit(self.name('core','c'),self.core_text('c',True));self.ctl('daemon-reload')
+        self.ctl('start',self.name('guard','c'))
         self.ctl('start',self.name('core','c'));wait_for(lambda:self.counter('c'))
         (self.root/'bootstrap-c.json').unlink();time.sleep(.1)
-        assert self.state(self.name('core','c'))['ActiveState']=='active'
-        # A crashed guard stops only its own core.
+        assert self.state(self.name('core','c'))['ActiveState']=='active' and self.gate(self.name('core','c'))==''
+        # A crashed guard closes only its own Core's gate; that Core keeps its process.
         self.ctl('kill','--kill-whom=main','--signal=SIGKILL',self.name('guard','a'))
-        wait_for(lambda:self.state(self.name('core','a'))['ActiveState']=='inactive')
-        assert self.state(self.name('core','b'))['MainPID']==before['b']['MainPID'] and self.clients['b'].error is None
-        # No fake freshness: withholding only b's counter observations expires b.
-        (self.root/'pause-b').touch();wait_for(lambda:self.state(self.name('core','b'))['ActiveState']=='inactive',timeout=7)
-        assert self.state(self.name('core','c'))['ActiveState']=='active'
-        return {'handoff_seconds':round(elapsed,3),'core_pid_and_single_tcp_preserved':True,'single_writer_accounting':True,'guard_failure_isolated':True,'stale_sample_failed_closed':True,'new_core_bootstrap':True}
+        wait_for(lambda:self.gate(self.name('core','a')))
+        assert self.state(self.name('core','a'))['ActiveState']=='active' and self.state(self.name('core','a'))['MainPID']==before['a']['MainPID']
+        assert self.gate(self.name('core','b'))=='' and self.state(self.name('core','b'))['MainPID']==before['b']['MainPID'] and self.clients['b'].error is None
+        # No fake freshness: withholding only b's counter observations closes b's gate.
+        (self.root/'pause-b').touch();wait_for(lambda:self.gate(self.name('core','b')),timeout=8)
+        assert self.state(self.name('core','b'))['ActiveState']=='active' and self.state(self.name('core','b'))['MainPID']==before['b']['MainPID']
+        assert self.state(self.name('core','c'))['ActiveState']=='active' and self.gate(self.name('core','c'))==''
+        return {'handoff_seconds':round(elapsed,3),'core_pid_and_single_tcp_preserved':True,'single_writer_accounting':True,
+                'guard_failure_closes_only_its_gate':True,'stale_sample_closed_gate_core_kept':True,'new_core_bootstrap':True}
     def fallback(self):
         self.setup(fail=True);self.prepare();before=self.adopt()
         began=time.monotonic();self.ctl('stop',self.old)
@@ -164,7 +183,9 @@ class Scenario:
         # Restore old dependencies only after old writer has real fresh samples.
         for worker in ('a','b'):self.write_unit(self.name('core',worker),self.core_text(worker,False))
         self.ctl('daemon-reload');self.assert_streams(before)
-        for worker in ('a','b'):assert self.old in self.state(self.name('core',worker))['BindsTo'].split()
+        for worker in ('a','b'):
+            state=self.state(self.name('core',worker))
+            assert self.old in state['BindsTo'].split() and state['IPAddressDeny']==''  # restored and never left closed
         return {'failed_takeover_returned_to_old_writer':True,'core_pid_and_single_tcp_preserved':True,'database_restored':False}
     def tls_namespace(self):
         private=self.root/'private';private.mkdir(mode=0o700)
@@ -196,7 +217,8 @@ class Scenario:
             path=Path('/etc/systemd/system')/name
             if body is not None and path.is_file() and not path.is_symlink() and path.read_text()==body:path.unlink()
         if self.units:self.ctl('daemon-reload',check=False)
-        shutil.rmtree(self.root,ignore_errors=True);self.fixture.unlink(missing_ok=True)
+        shutil.rmtree(self.root,ignore_errors=True);self.fixture.unlink(missing_ok=True);self.gate_script.unlink(missing_ok=True)
+        for path in Path('/run/systemd/system.control').glob(self.prefix+'-*'):shutil.rmtree(path,ignore_errors=True)
         for path in self.extra_paths:
             if path.parent==Path('/run') and path.name.startswith(self.prefix):shutil.rmtree(path,ignore_errors=True)
 
