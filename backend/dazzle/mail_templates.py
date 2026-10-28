@@ -114,6 +114,15 @@ def render(kind: str, **context) -> MailTemplate:
     elif kind in {"provider_reset_confirmed", "provider_observation", "provider_changed", "provider_warning", "provider_observed"}:
         title = "服务商流量信息已更新"
         text = "已记录新的服务商流量资料，请在 Mac 管理 App 核对来源与可信状态。服务商记录与管理员额度周期分别保存，本次记录不会重复发放用户额度。"
+    elif kind == "provider_auto_reset":
+        title = "QQG 流量已重置"
+        text = "自动同步发现 QQG 已用流量归零或大幅下降，已记录为服务商实际重置。管理员设定的用户额度周期仍按原计划切换，不会因此提前发放或重置用户额度。"
+    elif kind == "provider_auto_low":
+        title = "QQG 剩余流量偏低"
+        text = "QQG 实时剩余流量已低于提醒线。管理员共享额度会按 QQG 实际剩余自动收紧，已分配给注册用户的额度不变。请在 Mac 管理 App 核对用量，必要时调整预算或在 QQG 购买流量包。"
+    elif kind == "provider_sync_failed":
+        title = "QQG 自动同步中断"
+        text = "已有一段时间无法读取 QQG 流量数据。代理连接不受影响；6 小时内仍按上次读数扣除本地用量估算，之后只按本地预算计算。请检查 API 密钥、IP 白名单或 QQG 网站状态。"
     elif kind == "metering_failure":
         title = "用量统计异常，需要检查"
         text = "系统暂时无法确认连续的用量统计，已记录异常，并按账户规则限制相关连接。请在 Mac 管理 App 查看实际状态；恢复前请核对中断期间的用量，保留已有记录。"

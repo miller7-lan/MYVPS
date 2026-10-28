@@ -34,7 +34,8 @@ WRITES = {"user.add", "user.enable", "user.disable", "user.revoke", "user.rotate
           "user.topup", "user.delete", "settings.update", "provider.observe", "meter.reconcile",
           "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences",
           "registration.approve", "registration.reject", "registration.bind", "user.recovery.apply",
-          "budget.configure", "trial.create", "trial.update", "user.cleanup.confirm", "user.subscription_email"}
+          "budget.configure", "trial.create", "trial.update", "user.cleanup.confirm", "user.subscription_email",
+          "provider.configure"}
 ALLOWED_ACTIONS = READS | WRITES
 MAX_MESSAGE = 1024 * 1024
 PARAMETERS = {
@@ -60,6 +61,7 @@ PARAMETERS = {
     "provider.observe": {"instance_id", "remaining_display", "total_display", "expected_reset_date", "evidence", "kind",
                          "external_cycle_id", "last_actual_reset_at", "cycle_start_at", "expected_reset_at", "timezone",
                          "unit_verified", "total_bytes", "remaining_bytes"},
+    "provider.configure": {"enabled", "api_url", "username", "token", "host_id", "interval_seconds"},
 }
 
 
@@ -153,6 +155,7 @@ def snapshot(store: ProductionStore, now=None) -> dict:
     value["health"].update({"proxy": "parallel_workers", "metering": "native_payload",
                             "mail": "smtp" if value["mail"]["configured"] else "not_enabled", "ssh": "fixed_control_entry",
                             "portal": store.get_meta("portal_worker_status", "not_observed"),
+                            "provider_sync_worker": store.get_meta("provider_worker_status", "not_observed"),
                             "controller_mode": "recovery_only" if store.get_meta("agent_recovery_only", False) else "normal"})
     return value
 
@@ -213,7 +216,8 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         if set(params) & {"at", "now", "clock", "epoch", "uplink", "downlink"}:
             raise domain.DomainError("VALIDATION", "Production clocks and meter samples cannot be injected")
         sensitive = action == "user.export"
-        private_request = (action == "mail.configure" and "secret" in params) or action == "mail.verify.confirm"
+        private_request = ((action == "mail.configure" and "secret" in params) or action == "mail.verify.confirm" or
+                           (action == "provider.configure" and "token" in params))
         if (action in WRITES or sensitive) and request.get("server_id") != store.server_id:
             raise domain.DomainError("SERVER_ID_MISMATCH", "Refresh and confirm the registered server identity")
         if request.get("server_id") is not None and request["server_id"] != store.server_id:
@@ -289,6 +293,9 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
         elif action == 'budget.configure':
             from .budget import configure
             data = configure(store, params, now)
+        elif action == "provider.configure":
+            from .provider_sync import configure as configure_provider
+            data = configure_provider(store, params, now)
         elif action in {'trial.create', 'trial.update', 'user.cleanup.confirm'}:
             from . import trials
             data = {'trial.create': trials.create, 'trial.update': trials.update,

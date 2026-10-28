@@ -93,6 +93,7 @@ public struct ProxyUser: Identifiable, Sendable, Hashable {
     }
     public var name: String { raw["name"].string ?? id }
     public var role: String { raw["role"].string ?? "member" }
+    public var sharesAdministratorBudget: Bool { role == "admin" || raw["quota_pool"].string == "administrator" }
     public var used: Int64 { (raw["used_upload"].int ?? 0) + (raw["used_download"].int ?? 0) }
     public var quota: Int64? { raw["unlimited"].bool == true ? nil : raw["quota_bytes"].int }
     public var allowance: Int64? { quota.map { $0 + (raw["topup_bytes"].int ?? 0) } }
@@ -110,8 +111,11 @@ public enum UserPayload {
                                      "auto_restore": .bool(autoRestore), "threshold_percent": .integer(Int64(thresholdPercent))]
         let address = email.trimmingCharacters(in: .whitespacesAndNewlines)
         p["email"] = address.isEmpty ? .null : .string(address)
-        if user.role != "admin" {
-            guard let quotaBytes, quotaBytes > 0 else { throw ModelError.invalidResponse("普通用户的基础额度必须大于 0。") }
+        if user.raw["quota_pool"].string == "administrator", quotaBytes != nil {
+            throw ModelError.invalidResponse("管理员额度池成员共用剩余预算，不能单独设置固定额度。")
+        }
+        if user.role != "admin", let quotaBytes {
+            guard QuotaInput.valid(quotaBytes, minimumGB: user.isTrial ? 1 : 50) else { throw ModelError.invalidResponse("普通用户额度需为至少 50 GB 的整数；体验用户至少 1 GB。") }
             p["quota_bytes"] = .integer(quotaBytes)
         }
         return p
@@ -196,6 +200,9 @@ public enum Display {
     }
     public static func reason(_ text: String) -> String {
         ["manual_disabled": "手动停用", "quota_exceeded": "额度用尽", "quota": "额度用尽", "revoked": "已撤销",
-         "metering_failure": "计量异常", "pool_protection": "总池保护", "pool_exhausted": "总池保护", "pool": "总池保护" ][text] ?? text
+         "metering_failure": "计量异常", "pool_protection": "总池保护", "pool_exhausted": "总池保护", "pool": "总池保护",
+         "deleted": "已删除", "expired": "已到期", "trial_expired": "体验已到期", "unprovisioned": "资源未配置",
+         "runtime_integrity": "实例完整性待核对", "operation_in_progress": "已有操作正在执行",
+         "manual": "手动停用", "expiry": "已到期", "unknown_gap": "存在未核实计量间隙" ][text] ?? text
     }
 }

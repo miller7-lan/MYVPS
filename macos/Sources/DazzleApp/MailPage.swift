@@ -112,6 +112,9 @@ struct MailPage: View {
         case "cycle_summary": "周期总结"
         case "cycle_started": "新周期"
         case "provider_warning": "商家信息提醒"
+        case "provider_auto_reset": "QQG 流量重置"
+        case "provider_auto_low": "QQG 余量提醒"
+        case "provider_sync_failed": "QQG 同步中断"
         default: "邮件通知"
         }
     }
@@ -133,7 +136,7 @@ private struct SMTPSettingsSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            HStack { Text("统一发件设置").font(.title2.weight(.semibold)); Spacer(); Button("完成") { secret = ""; dismiss() }.disabled(store.busy) }
+            HStack { Text("统一发件设置").font(.title2.weight(.semibold)); Spacer(); Button("完成") { secret = ""; dismiss() }.disabled(store.isSubmitting("mail.configure")) }
             Form {
                 Picker("服务", selection: $preset) {
                     Text("QQ 邮箱 · 465 SSL").tag("qq465")
@@ -152,7 +155,7 @@ private struct SMTPSettingsSheet: View {
                 TextField("发件地址", text: $sender, prompt: Text("sender@example.com"))
                 SecureField(configured ? "授权码（留空沿用）" : "邮箱授权码", text: $secret).privacySensitive()
                 TextField("管理员收件邮箱", text: $adminEmail, prompt: Text("admin@example.com"))
-            }.formStyle(.grouped).disabled(store.busy)
+            }.formStyle(.grouped).disabled(store.isSubmitting("mail.configure"))
             Text("填写邮箱授权码。授权码仅提交给当前服务器，不保存在本机；修改 SMTP 主机、端口、加密或账号后需重新填写。更改管理员邮箱后需要重新验证。")
                 .font(.caption).foregroundStyle(VPSTheme.muted)
             Link("前往 QQ 邮箱获取授权码", destination: URL(string: "https://mail.qq.com/")!).font(.caption)

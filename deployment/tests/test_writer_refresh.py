@@ -214,6 +214,52 @@ class WriterRefreshTests(unittest.TestCase):
                 self.assertFalse(plan["ready_for_approval"])
                 self.assertIn("GUARD", [v["code"] for v in plan["issues"]])
 
+    def test_completed_root_proof_allows_historical_labels_without_restarting_guards(self):
+        for phase in ("bootstrap-inactive", "activation-transition", "api-only-origin", "activation-origin", "api-only"):
+            with self.subTest(phase=phase):
+                world = RefreshWorld(); host = RefreshFakeHost(world)
+                host.completed_guard_proof = lambda identifier, worker: True
+                for identifier, unit in ((world.admin, world.admin_guard), (world.member, world.guard)):
+                    world.units[unit]["status"] = "member-guard-ready; worker=%s; phase=%s" % (identifier, phase)
+                units = (world.admin_unit, world.member_unit, world.admin_guard, world.guard)
+                before = {unit:world.units[unit]["pid"] for unit in units}
+                plan = refresh.build_plan(host,world.layout,new_release_id=world.new_release)
+                self.assertTrue(plan["ready_for_approval"], plan["issues"])
+                result = refresh.RefreshCoordinator(host,world.layout,plan,approve(plan)).run()
+                self.assertEqual(result["status"],"refresh_complete",result)
+                self.assertEqual({unit:world.units[unit]["pid"] for unit in units},before)
+
+    def test_completed_root_proof_cannot_hide_untrusted_or_unsettled_workers(self):
+        for target,key,value in (("worker","origin_pending",1),("worker","root_ack_generation",999),
+                                 ("user","trusted_sample",0),("user","manual_disabled",1),
+                                 ("user","meter_state","unknown")):
+            with self.subTest(field=key):
+                world=RefreshWorld();host=RefreshFakeHost(world)
+                host.completed_guard_proof=lambda identifier,worker:True
+                world.units[world.admin_guard]["status"]="member-guard-ready; worker=%s; phase=activation-transition" % world.admin
+                original=world.facts
+                def facts():
+                    result=original()
+                    row=next(r for r in result["workers" if target=="worker" else "users"]
+                             if r["worker_id" if target=="worker" else "id"]==world.admin)
+                    row[key]=value
+                    return result
+                world.facts=facts
+                plan=refresh.build_plan(host,world.layout,new_release_id=world.new_release)
+                self.assertFalse(plan["ready_for_approval"],plan["issues"])
+
+    def test_completed_root_evidence_is_bound_to_config_pid_generation_and_running_mode(self):
+        world=RefreshWorld();host=refresh.RefreshHost(world.layout)
+        config=b'fixture current worker config'
+        host.read_trusted=lambda path:json.dumps(world.policy).encode() if path==world.layout.policy else config
+        worker={"process_id":4300,"root_ack_generation":3}
+        proof={"phase":"complete","mode":"running","generation":3,"process_id":4300,"config_sha256":sha256(config)}
+        with patch('dazzle.meter_guard.read_proof',return_value=proof):
+            self.assertTrue(host.completed_guard_proof(world.member,worker))
+        for key,value in (("phase","prepared"),("mode","staged"),("generation",4),("process_id",999),("config_sha256","0"*64)):
+            with self.subTest(field=key),patch('dazzle.meter_guard.read_proof',return_value={**proof,key:value}):
+                self.assertFalse(host.completed_guard_proof(world.member,worker))
+
     def test_true_unlimited_administrator_preparation_is_not_ready(self):
         self.world.users[self.world.admin].update(unlimited=1, quota_bytes=None)
         self.world.units[self.world.admin_guard]["status"] = "member-guard-ready; worker=%s; phase=admin-preparing" % self.world.admin

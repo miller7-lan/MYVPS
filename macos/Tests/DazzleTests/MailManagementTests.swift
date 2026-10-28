@@ -41,6 +41,32 @@ import DazzleModels
     #expect(!MailStatus.historyLabel("queued").contains("送达"))
 }
 
+@Test func subscriptionMailNeedsAnActiveTrustedUserAndVerifiedBoundEmail() throws {
+    var value: [String: JSONValue] = ["id": .string("member"), "email": .string("member@example.test"),
+        "email_verified": .bool(true), "runtime_state": .string("running"),
+        "runtime_verified_at": .string("2026-10-27T00:00:00Z"), "meter_state": .string("trusted")]
+    func user() throws -> ProxyUser { try #require(ProxyUser(.object(value))) }
+    #expect(try user().canReceiveSubscriptionEmail)
+    for (key, bad) in [("email_verified", JSONValue.bool(false)), ("email", .string("")),
+                       ("runtime_state", .string("staged")), ("runtime_verified_at", .null),
+                       ("meter_state", .string("reconciliation_required")),
+                       ("subscription_email_available", .bool(false)),
+                       ("disabled_reasons", .array([.string("manual_disabled")]))] {
+        let original = value[key]
+        value[key] = bad
+        #expect(try !user().canReceiveSubscriptionEmail)
+        value[key] = original
+    }
+    let queued = MailFeedback.message(action: "user.subscription_email", result: .object(["queued": .bool(true)]))
+    #expect(!queued.warning && queued.text.contains("已排队"))
+    #expect(!queued.text.contains("已送达"))
+    let refused = MailFeedback.message(action: "user.subscription_email", result: .object(["queued": .bool(false), "reason": .string("cooldown")]))
+    #expect(refused.warning && refused.text.contains("频繁"))
+    #expect(ServerContext.writeActions.contains("user.subscription_email"))
+    let request = RPCRequest(action: "user.subscription_email", revision: 7, params: ["user_id": .string("member")])
+    #expect(request.expected_revision == 7 && request.params.object.count == 1)
+}
+
 @Test func archiveDeletionProtectsTheLastAdministratorAndPreservesSeparateHistory() throws {
     let admin = try #require(ProxyUser(.object(["id": .string("admin"), "role": .string("admin"), "status": .string("ready")])))
     let member = try #require(ProxyUser(.object(["id": .string("member"), "role": .string("member"), "status": .string("ready")])))
@@ -55,7 +81,7 @@ import DazzleModels
     #expect(snapshot["deleted_users"].array.first?["id"].string == "member")
     let pending = try #require(ProxyUser(.object(["id": .string("pending"), "runtime_state": .string("stop_pending")])))
     let failed = try #require(ProxyUser(.object(["id": .string("failed"), "runtime_state": .string("stop_failed")])))
-    let stopped = try #require(ProxyUser(.object(["id": .string("stopped"), "runtime_state": .string("revoked")])))
+    let stopped = try #require(ProxyUser(.object(["id": .string("stopped"), "runtime_state": .string("revoked"), "worker": .object(["process_id": .null, "last_error": .null, "verified_at": .string("2026-10-25T16:19:00+08:00")])])))
     #expect(!UserDeletionPolicy.stopConfirmed(pending))
     #expect(!UserDeletionPolicy.stopConfirmed(failed))
     #expect(UserDeletionPolicy.stopConfirmed(stopped))

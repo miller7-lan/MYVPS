@@ -480,10 +480,14 @@ def snapshot(store: Store, now: dt.datetime | None = None) -> dict:
         warnings.append("Provider observation is missing or older than one hour; protection is insufficiently verified.")
     if settings["admin_reserve_bytes"] is None or settings["safety_margin_bytes"] is None:
         warnings.append("Administrator reserve and safety margin are not configured.")
+    from .provider_sync import status as provider_sync_status
+    sync = provider_sync_status(store, now)
+    if sync["enabled"] and sync["state"] == "error":
+        warnings.append("QQG automatic sync is failing; after six hours only the local budget applies.")
     from .budget import snapshot as budget_snapshot
     return {"schema_version": 1, "mode": store.get_meta("mode"), "revision": store.revision,
             "settings": settings, "quota_cycle": current, "provider": provider,
-            "provider_freshness": freshness, "users": users, "deleted_users": deleted_users,
+            "provider_freshness": freshness, "provider_sync": sync, "users": users, "deleted_users": deleted_users,
             "totals": {"users_count": sum(user["status"] != "revoked" for user in users),
                        "members_allocated_bytes": members_allocated,
                        "used_upload": sum(user["used_upload"] for user in all_users),
@@ -496,7 +500,8 @@ def snapshot(store: Store, now: dt.datetime | None = None) -> dict:
             "cycles": cycles,
             "metering_incidents": [dict(row) for row in store.conn.execute(
                 "SELECT * FROM metering_incidents ORDER BY detected_at DESC,id LIMIT 200")],
-            "health": {"proxy": "not_deployed", "metering": "simulated", "provider": provider.get("sync_state", "unverified"),
+            "health": {"proxy": "not_deployed", "metering": "simulated",
+                       "provider": "automatic_" + sync["state"] if sync["enabled"] else provider.get("sync_state", "unverified"),
                        "mail": "simulated" if mail["configured"] else "not_configured", "ssh": "not_checked", "warnings": warnings}}
 
 

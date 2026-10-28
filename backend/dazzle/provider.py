@@ -1,7 +1,9 @@
 """Provider evidence is independent of administrator quota allocation.
 
-No guessed QQG endpoints, browser cookies or live billing operations. An official
-adapter may be added only after verifying its documented scopes, units and fields.
+No guessed QQG endpoints, browser cookies or live billing operations. The only
+automatic source is qqg.py (the IDCSmart V10 API-key login and the 魔方云 traffic
+card QQG's own console reads), applied by provider_sync.py; this module keeps
+the explicit administrator evidence intake.
 """
 from __future__ import annotations
 from dataclasses import asdict, dataclass

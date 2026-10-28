@@ -2,6 +2,8 @@
 
 An unconfigured installation retains its existing authorisations. Adoption is an
 explicit administrative transaction. All numbers use integer decimal GB/bytes.
+A fresh automatic QQG reading (provider_sync) can only lower the administrators'
+shared remainder and refuse growing promises; it never raises either.
 """
 from __future__ import annotations
 
@@ -145,27 +147,51 @@ def reservations(store, *, replace_user=None, replace_allowance=None):
     return result
 
 
+def _provider_estimate(store, now):
+    from .provider_sync import remaining_estimate
+    return remaining_estimate(store, now if now is not None else store.now)
+
+
 def snapshot(store, now=None):
     active = configured(store)
     total = store.get_setting("budget_total_bytes") if active else None
     margin = store.get_setting("budget_safety_bytes") if active else None
     spent = _used_this_cycle(store)
     reserved = reservations(store) if active else 0
-    remaining = max(0, total - margin - spent - reserved) if active else None
+    local = max(0, total - margin - spent - reserved) if active else None
+    remaining, limited_by, provider = local, "local" if active else None, None
+    estimate = _provider_estimate(store, now) if active else None
+    if estimate is not None:
+        # QQG's own remainder, after the same margin and member reservations, can
+        # only lower the administrators' share; it never raises it above local.
+        cap = max(0, estimate["estimated_remaining_bytes"] - margin - reserved)
+        provider = {**estimate, "admin_cap_bytes": cap,
+                    "overcommitted_bytes": max(0, reserved + margin - estimate["estimated_remaining_bytes"])}
+        if cap < local:
+            remaining, limited_by = cap, "provider"
     pool = pool_users(store)
     admin = next((user for user in pool if user["role"] == "admin"), None)
     admin_used = admin["used_upload"] + admin["used_download"] if admin else 0  # Same basis as refresh_admin.
+    if not active:
+        reason = "请先确认套餐预算和安全余量；商家实时余额尚未核验。"
+    elif remaining >= GB:
+        reason = ""
+    else:
+        reason = "QQG 实际剩余不足1GB" if limited_by == "provider" else "可分配预算不足1GB"
+    notice = ("本地预算与 QQG 实时剩余取较小值；QQG 读数会扣除之后的本地用量。" if estimate is not None else
+              "本地预算，不等于QQG实时计费余额。")
     return {"source": "administrator_budget" if active else "not_configured", "configured": active,
             "administrator_pool": {"user_ids": [user["id"] for user in pool],
                                    "used_bytes": sum(user["used_upload"] + user["used_download"] for user in pool)},
-            "verified": False, "provider_remaining_verified": False, "can_allocate": bool(active and remaining >= GB),
-            "reason": ("" if remaining >= GB else "可分配预算不足1GB") if active else "请先确认套餐预算和安全余量；商家实时余额尚未核验。",
+            "verified": estimate is not None, "provider_remaining_verified": estimate is not None,
+            "can_allocate": bool(active and remaining >= GB), "reason": reason,
             "total_bytes": total, "safety_margin_bytes": margin, "used_bytes": spent,
-            "members_reserved_bytes": reserved, "available_bytes": remaining,
+            "members_reserved_bytes": reserved, "available_bytes": remaining, "local_available_bytes": local,
+            "limited_by": limited_by, "provider": provider,
             "admin_allowance_bytes": admin_used + remaining if active else None,
             "admin_remaining_bytes": remaining, "confirmed_at": store.get_setting("budget_confirmed_at"),
             "overcommitted_bytes": max(0, spent + reserved + (margin or 0) - (total or 0)) if active else 0,
-            "accounting_basis": "local_proxy_payload", "notice": "本地预算，不等于QQG实时计费余额。"}
+            "accounting_basis": "local_proxy_payload", "notice": notice}
 
 
 def validate_allowance(store, allowance, *, user=None, trial=False):
@@ -193,6 +219,11 @@ def validate_allowance(store, allowance, *, user=None, trial=False):
         reserved += allowance
     if _used_this_cycle(store) + reserved + margin > total:
         raise DomainError("BUDGET_EXCEEDED", "超过可分配预算，操作未生效；不会挤占其他用户预留额度")
+    estimate = _provider_estimate(store, store.now)
+    # Only a growing promise is checked against QQG, so a reduction is never refused.
+    if (estimate is not None and reserved > reservations(store) and
+            reserved + margin > estimate["estimated_remaining_bytes"]):
+        raise DomainError("PROVIDER_REMAINING_EXCEEDED", "超过 QQG 实际剩余流量，操作未生效；请先核对 QQG 余量或调整预算")
 
 
 def configure(store, params, now):

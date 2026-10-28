@@ -306,6 +306,8 @@ def run(store, helper=None, *, acquired_lock=None, collectors=None, stop=None, t
     mail_executor = MailExecutor(store)
     from .portal_rpc import PortalExecutor
     portal_executor = PortalExecutor(store)
+    from .provider_sync import ProviderExecutor
+    provider_executor = ProviderExecutor(store)
     def request_stop(*_):
         stopped.set()
     if threading.current_thread() is threading.main_thread():
@@ -322,6 +324,10 @@ def run(store, helper=None, *, acquired_lock=None, collectors=None, stop=None, t
                 portal_executor.start()
             except Exception:
                 portal_executor.failed.set()  # Portal failure must not stop existing proxy workers.
+            try:
+                provider_executor.start()
+            except Exception:
+                provider_executor.failed.set()  # Nor may a QQG reader failure.
             recovery = recovery or bool(store.get_meta("agent_recovery_only", False))
             notify("READY=1\nSTATUS=writer-recovery; reconciliation-required=true" if recovery else "READY=1\nSTATUS=writer-ready; trusted-samples=true")
             last_recovery = recovery
@@ -337,6 +343,9 @@ def run(store, helper=None, *, acquired_lock=None, collectors=None, stop=None, t
                 portal_state = "not_enabled" if not portal_executor.enabled else "error" if portal_executor.failed.is_set() else "running"
                 if store.get_meta("portal_worker_status") != portal_state:
                     store.set_meta("portal_worker_status", portal_state)
+                provider_state = "error" if provider_executor.failed.is_set() else "running"
+                if store.get_meta("provider_worker_status") != provider_state:
+                    store.set_meta("provider_worker_status", provider_state)
                 if executor.fatal.is_set():
                     raise ProductionError("HELPER_EXECUTOR_FAILED", "Registered worker executor failed")
                 results = []
@@ -358,6 +367,7 @@ def run(store, helper=None, *, acquired_lock=None, collectors=None, stop=None, t
                 stopped.wait(max(0, 0.5 - (time.monotonic() - began)))
         finally:
             portal_executor.close()
+            provider_executor.close()
             mail_executor.close()
             executor.close()
             collectors.close()
