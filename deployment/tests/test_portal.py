@@ -1,9 +1,11 @@
 from contextlib import closing
+import configparser
 import copy
 import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -33,15 +35,15 @@ def approval(preview, *, maintenance=True):
 
 
 class ResourcePolicyTests(unittest.TestCase):
-    def test_v1_remains_compatible_and_v2_adds_five_deterministic_unstarted_slots(self):
+    def test_v1_remains_compatible_and_v2_adds_three_deterministic_unstarted_slots(self):
         old = original_policy(); untouched = copy.deepcopy(old)
         new = portal_upgrade.expanded_policy(old, 1201)
         self.assertEqual(old, untouched)
         self.assertEqual(new, portal_upgrade.expanded_policy(old, 1201))
         self.assertEqual(new, backend_validate(new)); self.assertEqual(new, helper_validate(new))
-        self.assertEqual(len(new["workers"]), 7)
+        self.assertEqual(len(new["workers"]), 5)
         self.assertEqual({key: new["workers"][key] for key in old["workers"]}, old["workers"])
-        self.assertEqual(sorted(worker["public_port"] for worker in new["workers"].values()), list(range(24430, 24437)))
+        self.assertEqual(sorted(worker["public_port"] for worker in new["workers"].values()), list(range(24430, 24435)))
 
     def test_both_boundaries_reject_unapproved_ports_roles_and_web_identity(self):
         original = portal_upgrade.expanded_policy(original_policy(), 1201)
@@ -74,7 +76,7 @@ class ResourcePolicyTests(unittest.TestCase):
                 after = dict(store.conn.execute("SELECT * FROM production_workers WHERE worker_id=?", (existing,)).fetchone())
                 self.assertEqual(before, after)
                 fresh = [dict(row) for row in store.conn.execute("SELECT * FROM production_workers WHERE public_port>=24432")]
-                self.assertEqual(len(fresh), 5)
+                self.assertEqual(len(fresh), 3)
                 self.assertTrue(all(row["user_id"] is None and not row["provisioned"] and row["observed_state"] == "unprovisioned" for row in fresh))
                 self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM credentials").fetchone()[0], 0)
                 self.assertEqual(store.conn.execute("SELECT COUNT(*) FROM production_jobs").fetchone()[0], 0)
@@ -93,7 +95,7 @@ class ResourcePolicyTests(unittest.TestCase):
 class PortalPackageTests(unittest.TestCase):
     def setUp(self):
         test_deployment.ReleaseAndApprovalTests.setUp(self)
-        for name in ("portal.py", "registration.py", "portal_rpc.py"):
+        for name in ("portal.py", "registration.py", "portal_rpc.py", "meter_guard.py"):
             (self.repo / "backend/dazzle" / name).write_text("# isolated portal fixture\n")
         static = self.repo / "backend/dazzle/portal_static"; static.mkdir()
         for name in portal_release.STATIC_FILES: (static / name).write_text("isolated static fixture\n")
@@ -126,6 +128,71 @@ class PortalPackageTests(unittest.TestCase):
         for name in portal_release.STATIC_FILES: self.assertIn("backend/dazzle/portal_static/" + name, files)
         self.assertEqual(files["requirements.txt"], portal_release.requirements_bytes(manifest["wheels"]))
         self.assertEqual({entry["name"] for entry in manifest["wheels"]}, portal_release.REQUIRED_PACKAGES)
+
+    def test_hostname_templates_are_packaged_with_exact_contents_and_inventory_hashes(self):
+        self.build()
+        manifest, files = portal_release.inspect_archive(self.portal_archive)
+        hostname_templates = {name for name in portal_release.TEMPLATES if name.startswith("hostname")}
+        self.assertTrue({"hostname.conf", "hostname-certsync.service", "hostname-certsync.timer"}.issubset(hostname_templates))
+        for name in hostname_templates:
+            with self.subTest(template=name):
+                relative = "deployment/portal-systemd/" + name
+                expected = (self.repo / relative).read_bytes()
+                self.assertEqual(files[relative], expected)
+                self.assertEqual(manifest["files"][relative], sha256(expected))
+        self.assertFalse(any(name.endswith((".pem", ".key", ".sqlite3")) for name in files))
+
+    def test_missing_or_symlinked_hostname_template_cannot_produce_an_archive(self):
+        for name in (name for name in portal_release.TEMPLATES if name.startswith("hostname")):
+            path = self.repo / "deployment/portal-systemd" / name
+            content = path.read_bytes()
+            path.unlink()
+            try:
+                with self.subTest(template=name, condition="missing"), self.assertRaises(ValueError):
+                    self.build()
+                self.assertFalse(self.portal_archive.exists())
+                path.symlink_to(path.parent / "subscription.service")
+                with self.subTest(template=name, condition="symlink"), self.assertRaises(ValueError):
+                    self.build()
+                self.assertFalse(self.portal_archive.exists())
+            finally:
+                if path.is_symlink():
+                    path.unlink()
+                path.write_bytes(content)
+
+    def test_hostname_renewal_runs_only_its_lineage_then_syncs_without_proxy_or_ip_operations(self):
+        self.build()
+        _, files = portal_release.inspect_archive(self.portal_archive)
+        service_text = files["deployment/portal-systemd/hostname-renew.service"].decode()
+        timer_text = files["deployment/portal-systemd/hostname-renew.timer"].decode()
+        unit = configparser.ConfigParser(interpolation=None)
+        unit.read_string(service_text)
+        service = unit["Service"]
+        renewal = shlex.split(service["ExecStart"])
+        self.assertEqual(renewal[:2], ["/opt/qqg-certbot/bin/certbot", "renew"])
+        self.assertEqual(renewal.count("--cert-name"), 1)
+        self.assertEqual(renewal[renewal.index("--cert-name") + 1], "@HOSTNAME@")
+        self.assertIn("--no-directory-hooks", renewal)
+        self.assertNotIn("--force-renewal", renewal)
+        copy = shlex.split(service["ExecStartPost"])
+        self.assertEqual(copy[:5], ["/opt/dazzle-vps/current/venv/bin/python", "-I", "-m", "deployment.certsync",
+                                   "--managed-certbot-source"])
+        self.assertEqual(copy[copy.index("--hostname") + 1], "@HOSTNAME@")
+        self.assertEqual(copy[copy.index("--source-cert") + 1], "/etc/letsencrypt/live/@HOSTNAME@/fullchain.pem")
+        self.assertEqual(copy[copy.index("--source-key") + 1], "/etc/letsencrypt/live/@HOSTNAME@/privkey.pem")
+        self.assertEqual(service["Type"], "oneshot")
+        self.assertEqual(service["User"], "root")
+        self.assertEqual(service["ProtectSystem"], "strict")
+        self.assertLessEqual(int(service["TimeoutStartSec"]), 300)
+        self.assertEqual(set(shlex.split(service["ReadWritePaths"])),
+                         {"/etc/letsencrypt", "/var/lib/letsencrypt", "/var/log/letsencrypt", "/etc/dazzle-vps/web-tls"})
+        for forbidden in ("qqg-ip", "systemctl", "dazzle-proxy@", "dazzle-admin@", "/etc/dazzle-vps/tls"):
+            self.assertNotIn(forbidden, service_text)
+        timer = configparser.ConfigParser(interpolation=None)
+        timer.read_string(timer_text)
+        self.assertEqual(timer["Timer"]["OnCalendar"], "*-*-* 01,13:00:00 UTC")
+        self.assertEqual(timer["Timer"]["Persistent"], "true")
+        self.assertEqual(timer["Install"]["WantedBy"], "timers.target")
 
     def test_hash_mismatch_incomplete_lock_unapproved_dependency_and_pth_are_rejected(self):
         invalid = copy.deepcopy(self.lock); invalid[0]["sha256"] = "0" * 64
@@ -181,7 +248,7 @@ class PortalPackageTests(unittest.TestCase):
                                                   prefix=prefix, etc=etc, state_dir=self.base/'unused-state', baseline=target,
                                                   runner=runner, trusted_uid=os.getuid())
         self.assertTrue(preview["ready_for_approval"])
-        self.assertEqual(len(preview["new_workers"]), 5); self.assertEqual(len(preview["new_firewall_rules"]), 10)
+        self.assertEqual(len(preview["new_workers"]), 3); self.assertEqual(len(preview["new_firewall_rules"]), 6)
         self.assertFalse(preview["automatic_firewall_mutation"]); self.assertFalse(preview["registration_initially_enabled"])
         self.assertTrue(preview["member_maintenance"]["required"])
         self.assertEqual(set(self.base.rglob('*')), before); runner.run.assert_not_called()

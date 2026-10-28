@@ -192,7 +192,7 @@ class AlertsTests(unittest.TestCase):
         self.call("cycle.tick", at=self.now + dt.timedelta(hours=2))
         messages = self.messages("runtime_pause_failed")
         self.assertEqual(len(messages), 1)
-        self.assertIn("不能确认用户已停用", messages[0]["body"])
+        self.assertIn("尚未确认此账户的连接已经停止", messages[0]["body"])
 
     def test_failed_stop_alert_is_not_repeated_when_quota_cycle_changes(self):
         self.ready_admin()
@@ -210,8 +210,8 @@ class AlertsTests(unittest.TestCase):
         self.sample(user)
         self.sample(user, 100, 0, seconds=1)
         body = self.messages("quota_exceeded")[0]["body"]
-        self.assertIn("pause has been requested", body)
-        self.assertIn("no production suspension", body)
+        self.assertIn("已请求暂停", body)
+        self.assertIn("未执行线上停用操作", body)
 
     def test_quota_upcoming_within_24_hours_is_deduplicated(self):
         self.ready_admin()
@@ -219,7 +219,7 @@ class AlertsTests(unittest.TestCase):
             self.call("cycle.tick", at=parse_time(at))
         messages = self.messages("quota_cycle_upcoming")
         self.assertEqual(len(messages), 1)
-        self.assertIn("不是商家流量重置确认", messages[0]["body"])
+        self.assertIn("不代表服务商流量即将重置", messages[0]["body"])
 
     def test_quota_upcoming_is_absent_outside_24_hours(self):
         self.ready_admin()

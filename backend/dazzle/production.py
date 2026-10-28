@@ -10,6 +10,7 @@ import base64
 import copy
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import re
@@ -25,19 +26,26 @@ from urllib.parse import quote
 
 from . import domain
 from .production_state import (HELPER_SOCKET, POLICY_PATH, STATE_DIR, SUBSCRIPTION_PORT,
-                               TLS_CERT, TLS_KEY, ProductionStore, load_policy)
+                               TLS_CERT, TLS_KEY, ProductionStore, checked_hostname, load_policy, public_origin)
 from .store import parse_time, timestamp, utcnow
 
-READS = {"doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview", "mail.status", "registration.list"}
+READS = {"doctor", "status", "snapshot", "user.list", "user.resolve", "user.export", "deploy.preview", "rollback.preview", "mail.status", "registration.list", "user.recovery.preview"}
 WRITES = {"user.add", "user.enable", "user.disable", "user.revoke", "user.rotate", "user.update",
           "user.topup", "user.delete", "settings.update", "provider.observe", "meter.reconcile",
           "mail.configure", "mail.verify.send", "mail.verify.confirm", "mail.test", "mail.preferences",
-          "registration.approve", "registration.reject"}
+          "registration.approve", "registration.reject", "registration.bind", "user.recovery.apply",
+          "budget.configure", "trial.create", "trial.update", "user.cleanup.confirm", "user.subscription_email"}
 ALLOWED_ACTIONS = READS | WRITES
 MAX_MESSAGE = 1024 * 1024
 PARAMETERS = {
     "snapshot": set(), "status": set(), "doctor": set(), "user.list": {"include_deleted"}, "mail.status": set(),
     "registration.list": set(), "registration.approve": {"account_id", "quota_bytes"}, "registration.reject": {"account_id", "reason"},
+    "user.recovery.preview": {"user_id", "force_restart"}, "user.recovery.apply": {"user_id", "preview_token", "confirm_unknown_gap", "force_restart"},
+    "registration.bind": {"account_id", "user_id"},
+    "budget.configure": {"total_bytes", "safety_margin_bytes", "confirmed", "evidence"},
+    "trial.create": {"name", "duration_days", "quota_bytes"}, "trial.update": {"user_id", "duration_days", "quota_bytes"},
+    "user.cleanup.confirm": {"user_id", "confirm_unknown_gap"},
+    "user.subscription_email": {"user_id"},
     "user.resolve": {"user_id", "name"}, "user.export": {"user_id", "format"},
     "deploy.preview": set(), "rollback.preview": {"target"},
     "user.add": {"name", "role", "quota_bytes"},
@@ -45,9 +53,10 @@ PARAMETERS = {
     "mail.configure": {"host", "port", "security", "username", "sender", "admin_email", "secret"},
     "mail.verify.send": {"user_id", "email"}, "mail.verify.confirm": {"user_id", "email", "code"},
     "mail.test": {"user_id"}, "mail.preferences": {"enabled", "cooldown_seconds", "max_attempts"},
-    "user.update": {"user_id", "name", "quota_bytes", "unlimited", "auto_restore", "threshold_percent", "email"},
+    "user.update": {"user_id", "name", "quota_bytes", "unlimited", "auto_restore", "threshold_percent", "email", "quota_pool"},
     "user.topup": {"user_id", "bytes"}, "meter.reconcile": {"user_id", "evidence"},
-    "settings.update": {"default_quota_bytes", "admin_reserve_bytes", "safety_margin_bytes", "day", "time", "timezone", "registration_enabled"},
+    "settings.update": {"default_quota_bytes", "admin_reserve_bytes", "safety_margin_bytes", "day", "time", "timezone", "registration_enabled",
+                        "public_hostname"},
     "provider.observe": {"instance_id", "remaining_display", "total_display", "expected_reset_date", "evidence", "kind",
                          "external_cycle_id", "last_actual_reset_at", "cycle_start_at", "expected_reset_at", "timezone",
                          "unit_verified", "total_bytes", "remaining_bytes"},
@@ -112,7 +121,8 @@ def snapshot(store: ProductionStore, now=None) -> dict:
     value = domain.snapshot(store, now)
     value.update({"mode": "production", "environment": "production", "server_id": store.server_id,
                   "capabilities": {"controller": "root_policy", "allowed_actions": sorted(ALLOWED_ACTIONS),
-                                   "production_mutations": True, "legacy_retirement": False},
+                                   "production_mutations": True, "legacy_retirement": False,
+                                   "forced_user_recovery": True},
                   "legacy": {"managed": False, "ports": [443, 8443], "retirement_supported": False},
                   "accounting_scope": "New registered workers only; legacy443 and provider NIC billing excluded"})
     for user in value["users"] + value["deleted_users"]:
@@ -129,34 +139,55 @@ def snapshot(store: ProductionStore, now=None) -> dict:
                      "disabled" if store.get_user(user["id"])["manual_disabled"] else "enabled",
                      "runtime_state": state, "runtime_verified_at": worker["verified_at"],
                      "last_error": worker["last_error"], "worker": _worker_public(worker)})
+        from .trials import cleanup_status
+        user['cleanup'] = cleanup_status(store, store.get_user(user['id']), worker)
+        from .recovery import status as recovery_status
+        user["recovery"] = recovery_status(store, store.get_user(user["id"]), worker, now)
+        from .registration import subscription_email_availability
+        email_ready, email_reason = subscription_email_availability(store, user["id"], now)
+        user.update({"subscription_email_available": email_ready, "subscription_email_reason": email_reason})
     from .mail import snapshot_mail
     value["mail"] = snapshot_mail(store)
     from .registration import snapshot as registration_snapshot
     value["registration"] = registration_snapshot(store, now)
     value["health"].update({"proxy": "parallel_workers", "metering": "native_payload",
                             "mail": "smtp" if value["mail"]["configured"] else "not_enabled", "ssh": "fixed_control_entry",
-                            "portal": store.get_meta("portal_worker_status", "not_observed")})
+                            "portal": store.get_meta("portal_worker_status", "not_observed"),
+                            "controller_mode": "recovery_only" if store.get_meta("agent_recovery_only", False) else "normal"})
     return value
 
 
-def _add_user(store: ProductionStore, params: dict, now) -> dict:
+def _add_user(store: ProductionStore, params: dict, now, *, trial=False, reserved_account_id=None) -> dict:
     role = params.get("role", "member")
     if role not in {"member", "admin"}:
         raise domain.DomainError("VALIDATION", "Invalid user role")
-    row = store.conn.execute("SELECT * FROM production_workers WHERE role=? AND user_id IS NULL AND tombstoned=0 ORDER BY public_port LIMIT 1", (role,)).fetchone()
+    if role == "member":
+        from .registration import member_slots
+        row = next((slot for slot in member_slots(store) if slot["user_id"] is None and not slot["tombstoned"]), None)
+    else:
+        row = store.conn.execute("SELECT * FROM production_workers WHERE role=? AND user_id IS NULL AND tombstoned=0 ORDER BY public_port LIMIT 1", (role,)).fetchone()
     if row is None:
         raise domain.DomainError("APPROVAL_REQUIRED", "No unused approved slot for this role; expand the root manifest first")
     if role == "admin" and store.conn.execute("SELECT 1 FROM users WHERE role='admin' AND revoked_at IS NULL").fetchone():
         raise domain.DomainError("VALIDATION", "One live administrator is permitted")
-    identifier = row["worker_id"]
+    if role == "member":
+        from .registration import require_slot_capacity
+        require_slot_capacity(store, reserved_account_id=reserved_account_id)
+    worker_id = row['worker_id']
+    identifier = str(uuid.uuid4()) if store.conn.execute("SELECT 1 FROM users WHERE id=?", (worker_id,)).fetchone() else worker_id
     quota = None if role == "admin" else domain.integer(params.get("quota_bytes", store.get_setting("default_quota_bytes")), "quota_bytes", 1)
+    from . import budget, trials
+    if role == 'member':
+        budget.validate_allowance(store, quota, trial=trial)
     store.conn.execute("INSERT INTO users(id,name,role,port,quota_bytes,unlimited,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                        (identifier, domain.text(params.get("name"), "name"), role, row["public_port"], quota,
                         int(role == "admin"), timestamp(now), timestamp(now)))
     domain._new_credentials(store, identifier, 1, now)
     store.conn.execute("UPDATE credentials SET reality_public_key='' WHERE user_id=?", (identifier,))
     store.conn.execute("UPDATE production_workers SET user_id=?,api_secret=? WHERE worker_id=?",
-                       (identifier, secrets.token_urlsafe(36), identifier))
+                       (identifier, secrets.token_urlsafe(36), worker_id))
+    trials.register_lease(store, worker_id, identifier, now)
+    budget.refresh_admin(store, now)
     return {"user": domain._public_user(store, store.get_user(identifier), now)}
 
 
@@ -196,6 +227,17 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
             if cached[0] != fingerprint:
                 raise domain.DomainError("VALIDATION", "Request identifier was reused")
             return copy.deepcopy(cached[1])
+        if action == "user.recovery.preview":
+            # A preview is a real read: no schema, cycle creation or helper I/O.
+            from .recovery import preview
+            store.conn.execute("BEGIN")
+            try:
+                data = preview(store, params, now)
+                store.conn.commit()
+            except BaseException:
+                store.conn.rollback()
+                raise
+            return _response(identifier, store.revision, data=data)
         store.conn.execute("BEGIN IMMEDIATE")
         cached = store.conn.execute("SELECT fingerprint,response_json FROM requests WHERE request_id=?", (identifier,)).fetchone()
         if cached:
@@ -203,7 +245,11 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
                 raise domain.DomainError("VALIDATION", "Request identifier was reused")
             store.conn.rollback()
             return json.loads(cached["response_json"])
-        if action in WRITES or sensitive:
+        recovery_replay = False
+        if action == "user.recovery.apply":
+            from .recovery import applied_preview
+            recovery_replay = applied_preview(store, params)
+        if (action in WRITES or sensitive) and not recovery_replay:
             if type(request.get("expected_revision")) is not int or request["expected_revision"] != store.revision:
                 raise domain.DomainError("REVISION_CONFLICT", "Refresh before applying this change")
         domain.ensure_cycle(store, now)
@@ -235,19 +281,56 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
                     "workers": [_worker_public(dict(row)) for row in store.conn.execute("SELECT * FROM production_workers")]}
         elif action == "user.export":
             data = render_export(store, domain._user(store, params), params.get("format", "shadowrocket"))
+        elif action == "user.subscription_email":
+            from .registration import queue_subscription_email
+            data = queue_subscription_email(store, params, now)
         elif action == "user.add":
             data = _add_user(store, params, now)
+        elif action == 'budget.configure':
+            from .budget import configure
+            data = configure(store, params, now)
+        elif action in {'trial.create', 'trial.update', 'user.cleanup.confirm'}:
+            from . import trials
+            data = {'trial.create': trials.create, 'trial.update': trials.update,
+                    'user.cleanup.confirm': trials.confirm_cleanup}[action](store, params, now)
+        elif action == "user.recovery.apply":
+            from .recovery import apply as apply_recovery
+            data = apply_recovery(store, params, now)
         elif action.startswith("registration."):
             from .registration import handle_admin
             data = handle_admin(store, action, params, now)
-        elif action == "settings.update" and "registration_enabled" in params:
-            enabled = domain.boolean(params["registration_enabled"], "registration_enabled")
-            store.set_setting("registration_enabled", enabled)
-            remaining = {key: value for key, value in params.items() if key != "registration_enabled"}
+        elif action == "settings.update" and params.keys() & {"registration_enabled", "public_hostname"}:
+            if "public_hostname" in params:
+                # Empty clears it: new links return to the policy IP. Issued links never change.
+                try:
+                    value = params["public_hostname"]
+                    host = None if value is None or value == "" else checked_hostname(value)
+                except ValueError:
+                    raise domain.DomainError("VALIDATION", "public_hostname must be a lowercase DNS name") from None
+            if "registration_enabled" in params:
+                store.set_setting("registration_enabled", domain.boolean(params["registration_enabled"], "registration_enabled"))
+            if "public_hostname" in params:
+                store.set_setting("public_hostname", host)
+            remaining = {key: value for key, value in params.items() if key not in {"registration_enabled", "public_hostname"}}
             data = domain.handle_action(store, action, remaining, now) if remaining else {}
         else:
             data = domain.handle_action(store, action, params, now)
-        if action in WRITES:
+        if action in WRITES and not recovery_replay:
+            if action == "meter.reconcile" and params.get("user_id") in store.get_meta("agent_recovery_holds", {}):
+                worker = store.worker(params["user_id"])
+                if (worker["observed_state"] != "staged" or worker["origin_pending"] or
+                        worker["observed_generation"] != worker["root_ack_generation"]):
+                    raise domain.DomainError("VALIDATION", "Cold recovery requires a freshly sampled API-only worker")
+                holds = store.get_meta("agent_recovery_holds", {})
+                holds.pop(params["user_id"], None)
+                store.set_meta("agent_recovery_holds", holds)
+                store.set_meta("agent_recovery_only", bool(holds))
+            if params.get("user_id") and action in {"user.revoke", "user.delete"}:
+                holds = store.get_meta("agent_recovery_holds", {})
+                if params["user_id"] in holds:
+                    holds.pop(params["user_id"])
+                    store.set_meta("agent_recovery_holds", holds)
+                    store.set_meta("agent_recovery_only", bool(holds))
             if params.get("user_id") and action in {"user.rotate", "user.revoke", "user.delete"}:
                 from .registration import sync_user
                 sync_user(store, params["user_id"], now)
@@ -257,6 +340,8 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
             store.set_meta("revision", store.revision + 1)
             store.conn.execute("INSERT INTO operations VALUES(?,?,?,?,?)", (str(uuid.uuid4()), action, "requested",
                                 timestamp(now), "Parallel project only; legacy services are outside control"))
+            data = {**data, "snapshot": snapshot(store, now)}
+        elif recovery_replay:
             data = {**data, "snapshot": snapshot(store, now)}
         response = _response(identifier, store.revision, data=data)
         if action in WRITES and not private_request:
@@ -282,16 +367,20 @@ def handle_request(store: ProductionStore, request: dict, now=None) -> dict:
 
 def _parameters(store, worker):
     credentials = store.get_credentials(worker["user_id"])
-    return {key: credentials[key] for key in ("vless_uuid", "tuic_uuid", "tuic_password", "short_id")} | {"api_secret": worker["api_secret"]}
+    result = {key: credentials[key] for key in ("vless_uuid", "tuic_uuid", "tuic_password", "short_id")} | {"api_secret": worker["api_secret"]}
+    if worker['user_id'] != worker['worker_id']:
+        result['lease_id'] = worker['user_id']
+    return result
 
 
-def refresh_worker_status(store: ProductionStore, helper=None, now=None) -> None:
+def refresh_worker_status(store: ProductionStore, helper=None, now=None, *, user_id=None) -> None:
     """Reconcile root registry/cgroup facts after agent restart, never assume DB running."""
     if store.conn.in_transaction:
         raise RuntimeError("Status probe cannot run inside a SQLite transaction")
     helper = helper or HelperClient()
     now = parse_time(now) if now else utcnow()
-    workers = [dict(row) for row in store.conn.execute("SELECT * FROM production_workers WHERE user_id IS NOT NULL")]
+    workers = [dict(row) for row in store.conn.execute("SELECT * FROM production_workers WHERE user_id IS NOT NULL" + (" AND user_id=?" if user_id is not None else ""),
+                                                     (user_id,) if user_id is not None else ())]
     for worker in workers:
         result = helper.call({"version": 1, "request_id": str(uuid.uuid4()), "action": "status",
                               "worker_id": worker["worker_id"], "generation": 0, "params": {}})
@@ -344,8 +433,8 @@ def refresh_worker_status(store: ProductionStore, helper=None, now=None) -> None
                     domain._set_reasons(store, user["id"], set(json.loads(user["reasons_json"])) | {"metering_failure"}, now)
                     store.conn.execute("UPDATE users SET trusted_sample=0,meter_state='reconciliation_required' WHERE id=?", (user["id"],))
                 store.conn.execute("UPDATE production_workers SET generation=?,root_ack_generation=?,observed_generation=?,observed_state=?,process_id=?,"
-                                   "verified_at=?,origin_pending=CASE WHEN ? THEN 0 ELSE origin_pending END,last_error=? WHERE worker_id=?",
-                                   (result["generation"], result["generation"], result["generation"], state, result.get("process_id"), timestamp(now),
+                                   "verified_at=CASE WHEN ? OR origin_pending=0 THEN ? ELSE verified_at END,origin_pending=CASE WHEN ? THEN 0 ELSE origin_pending END,last_error=? WHERE worker_id=?",
+                                   (result["generation"], result["generation"], result["generation"], state, result.get("process_id"), int(changed), timestamp(now),
                                     int(changed), "RECOVERY_REQUIRED" if result.get("recovery_required") else None, worker["worker_id"]))
             plan_jobs(store, now)
             store.conn.commit()
@@ -355,12 +444,16 @@ def refresh_worker_status(store: ProductionStore, helper=None, now=None) -> None
 
 
 def plan_jobs(store: ProductionStore, now) -> None:
+    from . import recovery
     for row in store.conn.execute("SELECT * FROM production_workers WHERE user_id IS NOT NULL").fetchall():
         worker = dict(row)
         if store.conn.execute("SELECT 1 FROM production_jobs WHERE worker_id=? AND status IN ('pending','executing')", (worker["worker_id"],)).fetchone():
             continue
         user = store.get_user(worker["user_id"])
-        if worker["tombstoned"] or user["revoked_at"]:
+        from .trials import releasable
+        if releasable(store, worker):
+            action = 'release'
+        elif worker["tombstoned"] or user["revoked_at"]:
             action = "revoke" if worker["observed_state"] != "revoked" else None
         elif worker["last_error"] == "RECOVERY_REQUIRED":
             action = "stop"
@@ -368,24 +461,39 @@ def plan_jobs(store: ProductionStore, now) -> None:
             continue
         elif not worker["provisioned"]:
             action = "provision"
+        elif recovery.force_api_stage(store, user["id"]):
+            action = "stage"
         elif worker["observed_state"] in {"provisioned", "stopped", "stop_failed"}:
             action = "stage"
         elif worker["credential_version"] != user["credential_version"]:
             action = "stage"
+        elif (domain.managed_origin_pending(worker, user, now) and
+                "metering_failure" not in json.loads(user["reasons_json"]) and
+                not (set(domain.disabled_reasons(user, now)) - {"metering_failure"})):
+            # A slow, confirmed start may outlive the old stream's sample. Give
+            # this actual process its existing first-sample window, once only.
+            # Status probes must not renew verified_at while origin is pending.
+            continue
         elif domain.eligible(user, now):
             action = "activate" if worker["observed_state"] == "staged" and user["trusted_sample"] else None
         else:
             action = "stage" if worker["observed_state"] == "running" else None
+        if action == "activate" and worker["role"] == "member" and worker["user_id"] in store.get_meta("agent_recovery_holds", {}):
+            continue  # Explicit cold recovery never grants member proxy access.
+        if action == "activate" and recovery.activation_held(store, user["id"]):
+            continue  # Reconciliation must finish before a recovery opens access.
         if not action:
             continue
         generation = worker["root_ack_generation"] + 1
         identifier = str(uuid.uuid4())
         request = {"version": 1, "request_id": identifier, "action": action, "worker_id": worker["worker_id"],
-                   "generation": generation, "params": _parameters(store, worker) if action in {"provision", "stage", "activate"} else {}}
+                   "generation": generation, "params": _parameters(store, worker) if action in {"provision", "stage", "activate"} else {'lease_id': user['id']} if action == 'release' else {}}
         store.conn.execute("INSERT INTO production_jobs(id,worker_id,generation,credential_version,action,payload_json,created_at) VALUES(?,?,?,?,?,?,?)",
                            (identifier, worker["worker_id"], generation, user["credential_version"], action,
                             json.dumps(request, separators=(",", ":")), timestamp(now)))
         store.conn.execute("UPDATE production_workers SET generation=? WHERE worker_id=?", (generation, worker["worker_id"]))
+        if action == "stage":
+            recovery.stage_planned(store, user["id"], generation, now)
 
 
 def process_one_job(store: ProductionStore, helper=None, now=None) -> dict:
@@ -406,7 +514,7 @@ def process_one_job(store: ProductionStore, helper=None, now=None) -> dict:
     user = store.get_user(worker["user_id"])
     stale = job["credential_version"] != user["credential_version"] or (
         job["action"] == "activate" and not domain.eligible(user, now)) or (
-        job["action"] != "revoke" and bool(user["revoked_at"]))
+        job["action"] not in {"revoke", "release"} and bool(user["revoked_at"]))
     if stale:
         if job["attempts"] > 0:
             store.conn.rollback()
@@ -434,21 +542,30 @@ def process_one_job(store: ProductionStore, helper=None, now=None) -> dict:
                 result.get("generation") != job["generation"] or result.get("role") != worker["role"] or
                 result.get("public_port") != worker["public_port"] or result.get("api_port") != worker["api_port"]):
             raise ProductionError("HELPER_IDENTITY_MISMATCH", "Worker helper identity did not match root policy")
-        desired = {"provision": "provisioned", "stage": "staged", "activate": "running", "stop": "stopped", "revoke": "revoked"}[job["action"]]
-        if result.get("worker_state") != desired or (job["action"] in {"stop", "revoke"} and result.get("inactive_confirmed") is not True):
+        desired = {"provision": "provisioned", "stage": "staged", "activate": "running", "stop": "stopped", "revoke": "revoked", 'release': 'unprovisioned'}[job["action"]]
+        if result.get("worker_state") != desired or (job["action"] in {"stop", "revoke", 'release'} and result.get("inactive_confirmed") is not True):
             raise ProductionError("HELPER_STATE_UNCONFIRMED", "Worker state was not confirmed")
         if job["action"] in {"stage", "activate"} and (result.get("managed_origin_zero") is not True or type(result.get("process_id")) is not int):
             raise ProductionError("ORIGIN_UNCONFIRMED", "Managed worker origin was not confirmed")
     except Exception as exc:
         code = exc.code if isinstance(exc, ProductionError) else "HELPER_FAILED"
         acknowledged = None
+        confirmed_inactive = False
         if code != "HELPER_UNAVAILABLE":
             try:
                 status = helper.call({"version": 1, "request_id": str(uuid.uuid4()), "action": "status",
                                       "worker_id": worker["worker_id"], "generation": 0, "params": {}})
                 if (status.get("server_id") == store.server_id and status.get("worker_id") == worker["worker_id"] and
+                        status.get("role") == worker["role"] and
+                        status.get("public_port") == worker["public_port"] and status.get("api_port") == worker["api_port"] and
                         type(status.get("generation")) is int and status["generation"] >= worker["root_ack_generation"]):
                     acknowledged = status["generation"]
+                    # A failed start can have stopped the old Core already. Root's
+                    # verified empty cgroup is enough to record that stop; it is
+                    # never an origin sample or permission to reopen the proxy.
+                    confirmed_inactive = (status.get("worker_state") == "stopped" and
+                                          status.get("inactive_confirmed") is True and
+                                          status.get("process_id") is None and not status.get("tombstoned"))
             except Exception:
                 pass
         store.conn.execute("BEGIN IMMEDIATE")
@@ -458,6 +575,9 @@ def process_one_job(store: ProductionStore, helper=None, now=None) -> dict:
         if acknowledged is not None:
             store.conn.execute("UPDATE production_workers SET root_ack_generation=?,generation=? WHERE worker_id=?",
                                (acknowledged, acknowledged, worker["worker_id"]))
+        if confirmed_inactive:
+            store.conn.execute("UPDATE production_workers SET observed_state='stopped',process_id=NULL,origin_pending=0 WHERE worker_id=?",
+                               (worker["worker_id"],))
         if not retry:
             domain._incident(store, store.get_user(worker["user_id"]), "helper_operation_unconfirmed", now, context=job["id"])
             store.conn.execute("UPDATE users SET trusted_sample=0,meter_state='reconciliation_required' WHERE id=?", (worker["user_id"],))
@@ -467,15 +587,28 @@ def process_one_job(store: ProductionStore, helper=None, now=None) -> dict:
     now = now if explicit_clock else utcnow()
     store.conn.execute("BEGIN IMMEDIATE")
     try:
+        if job['action'] == 'release':
+            from .trials import finish_release
+            if result.get('tombstoned'):
+                raise ProductionError('RELEASE_UNCONFIRMED', '旧授权未安全归档，不能复用资源')
+            finish_release(store, worker, now)
+            store.conn.execute("UPDATE production_workers SET generation=?,root_ack_generation=?,observed_generation=? WHERE worker_id=?", (job['generation'], job['generation'], job['generation'], worker['worker_id']))
+            store.conn.execute("UPDATE production_jobs SET status='applied',completed_at=?,payload_json='{}' WHERE id=?", (timestamp(now), job['id']))
+            store.conn.commit()
+            return {'processed': True, 'applied': True, 'worker_state': 'unprovisioned'}
         current_user = store.get_user(worker["user_id"])
         if worker["observed_state"] == "running" and job["action"] in {"stage", "stop", "revoke"}:
             domain._incident(store, current_user, "managed_stop_tail", now, context=job["id"])
         if (job["action"] in {"stage", "activate", "stop", "revoke"} and current_user["meter_epoch"] and
                 current_user["last_sample_at"] and worker["observed_generation"] > 0):
+            baseline_at = timestamp(parse_time(current_user["last_sample_at"]))
+            baseline_cycle = store.conn.execute(
+                "SELECT id FROM cycles WHERE start_at<=? AND end_at>? ORDER BY start_at DESC LIMIT 1",
+                (baseline_at, baseline_at)).fetchone()
             store.conn.execute("INSERT OR REPLACE INTO production_retired_origins VALUES(?,?,?,?,?,?,?,?,?)",
                                (worker["worker_id"], worker["observed_generation"], worker["user_id"], current_user["meter_epoch"],
                                 current_user["last_uplink"], current_user["last_downlink"], current_user["last_sample_at"],
-                                timestamp(now), domain.ensure_cycle(store, now)["id"]))
+                                timestamp(now), baseline_cycle["id"] if baseline_cycle else "unverified-baseline-cycle"))
         origin = int(job["action"] in {"stage", "activate"})
         public_key = result.get("public_key") or worker["public_key"]
         if job["action"] not in {"stop", "revoke"} and (not isinstance(public_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", public_key)):
@@ -513,7 +646,7 @@ def accept_sample(store: ProductionStore, worker_id: str, generation: int, sampl
         return {"ignored": True, "reason": "revoked"}
     if worker["origin_pending"]:
         if (not worker["verified_at"] or parse_time(sample.at) < parse_time(worker["verified_at"]) or
-                (now - parse_time(sample.at)).total_seconds() > 5):
+                abs((now - parse_time(sample.at)).total_seconds()) > 5):
             return {"ignored": True, "reason": "origin_sample_outside_window"}
         # Only a successful helper-controlled process creation opens this gate.
         # First cumulative sample may be nonzero: charge every byte from origin0.
@@ -525,8 +658,10 @@ def accept_sample(store: ProductionStore, worker_id: str, generation: int, sampl
         store.conn.execute("UPDATE users SET meter_epoch=?,last_uplink=0,last_downlink=0,last_sample_at=?,trusted_sample=1,meter_state=? WHERE id=?",
                            (sample.epoch, sample.at, "reconciliation_required" if "metering_failure" in reasons else "trusted", user["id"]))
         store.conn.execute("UPDATE production_workers SET origin_pending=0,origin_epoch=? WHERE worker_id=?", (sample.epoch, worker_id))
+    # Native frames carry this host's wall-clock receipt time; a clock step must
+    # never escape drain() and stop the only ledger writer.
     result = domain._sample(store, {"user_id": user["id"], "epoch": sample.epoch, "uplink": sample.uplink,
-                                    "downlink": sample.downlink, "at": sample.at}, now, allow_revoked=True)
+                                    "downlink": sample.downlink, "at": sample.at}, now, allow_revoked=True, wall_clock=True)
     plan_jobs(store, now)
     return result
 
@@ -540,10 +675,12 @@ def _retired_sample(store, worker, generation, sample, now):
     if at <= previous or at > parse_time(retired["retired_at"]):
         return {"ignored": True, "reason": "retired_sample_outside_window"}
     up, down = sample.uplink - retired["last_upload"], sample.downlink - retired["last_download"]
-    user = store.get_user(worker["user_id"])
+    user = store.get_user(retired["user_id"])
     known = up >= 0 and down >= 0
-    current_cycle = domain.ensure_cycle(store, now)["id"]
-    if known and (at - previous).total_seconds() <= 5 and current_cycle == retired["cycle_id"]:
+    cycle = domain.ensure_cycle(store, now)
+    current_cycle = cycle["id"]
+    within_cycle = parse_time(cycle["start_at"]) <= previous < at <= parse_time(cycle["end_at"]) + dt.timedelta(seconds=5)
+    if known and (at - previous).total_seconds() <= 5 and within_cycle and current_cycle == retired["cycle_id"]:
         if user["used_upload"] + user["used_download"] + up + down > domain.MAX_INT:
             raise ProductionError("COUNTER_OVERFLOW", "Recorded usage exceeds supported range")
         minute = at.replace(second=0, microsecond=0)
@@ -555,7 +692,9 @@ def _retired_sample(store, worker, generation, sample, now):
             domain._quota(store, user["id"], now)
         allocated = True
     else:
-        domain._incident(store, user, "retired_origin_unallocated", now, epoch=sample.epoch, at=at,
+        old_baseline = {**user, "meter_epoch": retired["epoch"], "last_sample_at": retired["last_at"],
+                        "last_uplink": retired["last_upload"], "last_downlink": retired["last_download"]}
+        domain._incident(store, old_baseline, "retired_origin_unallocated", now, epoch=sample.epoch, at=at,
                          upload=sample.uplink, download=sample.downlink,
                          known_delta=(up, down) if known else None, context=str(generation))
         allocated = False
@@ -584,7 +723,7 @@ def render_export(store: ProductionStore, user: dict, format_name: str) -> dict:
     else:
         content, extension = "\n".join(nodes) + "\n", "txt"
     token = store.get_credentials(user["id"])["subscription_token"]
-    base = f"https://{endpoint}:{SUBSCRIPTION_PORT}/{token}/"
+    base = f"{public_origin(store)}/{token}/"
     return {"sensitive": True, "environment": "production", "server_id": store.server_id, "deployed": True,
             "runtime_state": worker["observed_state"], "filename": "Dazzle-VPS." + extension,
             "content": content, "nodes": list(nodes), "nodes_url": base + "nodes.txt", "config_url": base + "config.conf",
@@ -607,11 +746,16 @@ def subscription_response(store: ProductionStore, token: str, route: str, now=No
         return {"status": 404, "headers": headers, "body": b""}
     user = store.get_user(user_id)
     worker = store.worker(user_id)
-    if not domain.eligible(user, now) or worker["observed_state"] != "running" or worker["tombstoned"]:
+    from .trials import is_expired
+    if is_expired(store, user, now) or not domain.eligible(user, now) or worker["observed_state"] != "running" or worker["tombstoned"]:
         return {"status": 403, "headers": headers, "body": b""}
     artifact = render_export(store, user, {"nodes.txt": "uris", "config.conf": "shadowrocket", "config.yaml": "mihomo"}[route])
     allowance = 0 if user["unlimited"] else user["quota_bytes"] + user["topup_bytes"]
     headers["Subscription-Userinfo"] = f"upload={user['used_upload']}; download={user['used_download']}; total={allowance}"
+    from .trials import get as get_trial
+    trial = get_trial(store, user_id)
+    if trial and trial['expires_at']:
+        headers['Subscription-Userinfo'] += '; expire=' + str(int(parse_time(trial['expires_at']).timestamp()))
     headers["Profile-Title"] = "Dazzle'VPS (personal payload)"
     headers["profile-update-interval"] = "1"
     body = artifact["content"].encode()
@@ -664,6 +808,44 @@ class TLSContexts:
             return self.context
 
 
+class DeadlineStream(io.RawIOBase):
+    """Connection I/O under absolute deadlines, so trickled bytes cannot keep a server slot.
+
+    Reads (the deferred TLS handshake, request line and headers) share one budget from the moment
+    the worker takes the connection; the response has its own from its first write. Each blocking
+    call also still ends after `idle` seconds without progress.
+    """
+    def __init__(self, connection, idle, read_seconds, write_seconds, clock=time.monotonic):
+        self.connection, self.idle, self.write_seconds, self.clock = connection, idle, write_seconds, clock
+        self.read_deadline, self.write_deadline = clock() + read_seconds, None
+
+    def readable(self):
+        return True
+
+    def writable(self):
+        return True
+
+    def _arm(self, deadline):
+        remaining = deadline - self.clock()
+        if remaining <= 0:
+            raise TimeoutError("connection deadline exceeded")
+        self.connection.settimeout(min(self.idle, remaining))
+
+    def readinto(self, buffer):
+        self._arm(self.read_deadline)
+        return self.connection.recv_into(buffer)
+
+    def write(self, data):
+        if self.write_deadline is None:
+            self.write_deadline = self.clock() + self.write_seconds
+        with memoryview(data) as view, view.cast("B") as octets:
+            sent = 0
+            while sent < len(octets):
+                self._arm(self.write_deadline)
+                sent += self.connection.send(octets[sent:])
+        return sent
+
+
 class SubscriptionServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 16
@@ -708,9 +890,12 @@ def subscription_handler(policy, state_dir):
     class Handler(BaseHTTPRequestHandler):
         server_version = ""
         sys_version = ""
+        # Same totals as dazzle.portal: 5 s TLS + 5 s headers, then 15 s for the response.
+        idle_timeout, header_timeout, response_timeout = 5, 10, 15
         def setup(self):
-            super().setup()
-            self.connection.settimeout(5)
+            self.connection = self.request
+            stream = DeadlineStream(self.connection, self.idle_timeout, self.header_timeout, self.response_timeout)
+            self.rfile, self.wfile = io.BufferedReader(stream), stream
         def log_message(self, *_):
             pass
         def send_error(self, code, message=None, explain=None):
@@ -755,10 +940,24 @@ def main(argv=None):
     parser.add_argument("--policy", default=POLICY_PATH)
     parser.add_argument("--state-dir", default=STATE_DIR)
     parser.add_argument("command", choices=["initialize", "rpc", "agent", "subscription"])
+    parser.add_argument("--standby", action="store_true")
+    parser.add_argument("--allow-no-core-recovery", action="store_true")
     args = parser.parse_args(argv)
     request = None
     try:
         policy = load_policy(args.policy)
+        if args.allow_no_core_recovery and not args.standby:
+            raise ValueError("Cold recovery is an explicit standby option")
+        if args.standby and args.command != "agent":
+            raise ValueError("Standby is only available for the agent")
+        if args.command == "agent" and args.standby:
+            from .standby import run_standby
+            import signal
+            stopped = threading.Event()
+            signal.signal(signal.SIGTERM, lambda *_: stopped.set())
+            signal.signal(signal.SIGINT, lambda *_: stopped.set())
+            run_standby(args.state_dir, policy, stop=stopped, allow_no_core_recovery=args.allow_no_core_recovery)
+            return 0
         if args.command == "initialize":
             if os.geteuid() != 0:
                 raise ValueError("Initialization is installer-only")

@@ -1,6 +1,6 @@
 """Read-only upgrade review, offline staging, and subscription-only recovery.
 
-The upgrade review is NOT an installer. Accounts, five exact port grants,
+The upgrade review is NOT an installer. Accounts, three exact port grants,
 agent/member maintenance and the service switch require the separate operator
 checklist and human approval. Staging never changes current, policy or live DB.
 """
@@ -26,10 +26,11 @@ from .portal_release import inspect_archive
 from .repair import current_release, installed_inventory, original_authorization, validate_legacy
 from .update import backup_digest, capture_administrator, check_additive_migration
 
-NEW_PUBLIC_PORTS = tuple(range(24432, 24437))
-NEW_API_PORTS = tuple(range(34432, 34437))
+NEW_PUBLIC_PORTS = tuple(range(24432, 24435))  # Three fixed registration seats.
+NEW_API_PORTS = tuple(range(34432, 34435))
 PORTAL_SOCKET = "/run/dazzle-vps-portal/agent.sock"
 PORTAL_TLS = "/etc/dazzle-vps/web-tls"
+PORTAL_TLS_PRIVATE = "/run/dazzle-vps-web-tls"
 PORTAL_SERVICE = "dazzle-vps-subscription.service"
 
 
@@ -197,7 +198,7 @@ def rollback_preview(policy):
     policy = validate_policy(copy.deepcopy(policy))
     if policy["version"] != 2: raise ValueError("Subscription-only recovery requires portal v2")
     origin = "https://" + policy["server_endpoint"] + ":9443"
-    body = "[Service]\nExecStart=\nExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m dazzle.portal --socket " + PORTAL_SOCKET + " --host 0.0.0.0 --port 9443 --cert " + PORTAL_TLS + "/cert.pem --key " + PORTAL_TLS + "/key.pem --origin " + origin + " --subscription-only\n"
+    body = "[Service]\nExecStart=\nExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m dazzle.portal --socket " + PORTAL_SOCKET + " --host 0.0.0.0 --port 9443 --cert " + PORTAL_TLS_PRIVATE + "/cert.pem --key " + PORTAL_TLS_PRIVATE + "/key.pem --origin " + origin + " --subscription-only\n"
     return {"version": 1, "operation": "portal_subscription_only", "ready_for_approval": True,
             "server_id": policy["server_id"], "policy_sha256": sha256(canonical(policy)),
             "dropin_path": "/etc/systemd/system/dazzle-vps-subscription.service.d/subscription-only.conf", "dropin": body,

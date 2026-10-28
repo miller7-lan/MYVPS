@@ -29,7 +29,7 @@ MAX_REQUEST = 1024 * 1024
 CORE_SHA256 = "1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a"
 LEGACY_CONFIG_SHA256 = "6098e06774d74e9e08fd7ad22a974d65671fc64d6258e39915a06cc6bd2567c6"
 CREDENTIAL_KEYS = {"vless_uuid", "tuic_uuid", "tuic_password", "short_id", "api_secret"}
-VERBS = {"status", "provision", "stage", "activate", "stop", "revoke"}
+VERBS = {"status", "provision", "stage", "activate", "stop", "revoke", "release"}
 
 
 class HelperError(Exception):
@@ -57,6 +57,8 @@ class Layout:
     def tls_certificate(self): return self.etc / "tls" / "cert.pem"
     @property
     def tls_key(self): return self.etc / "tls" / "key.pem"
+    @property
+    def guard_proofs(self): return self.etc / "guard-proofs"
 
 
 class Runner:
@@ -64,6 +66,13 @@ class Runner:
         return subprocess.run(arguments, input=input, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=timeout, check=False,
                               env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C"})
+
+
+def machine_boot_id():
+    try:
+        return str(uuid.UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+    except (OSError, ValueError):
+        raise HelperError('GUARD_PROOF', 'The kernel boot identity is unavailable') from None
 
 
 def canonical_uuid(value):
@@ -274,7 +283,11 @@ class Helper:
                           "dashboard": {"enabled": False}, "access_control_allow_origin": ["https://invalid.example"],
                           "access_control_allow_private_network": False}],
             "inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}],
-            "route": {"rules": [{"ip_is_private": True, "action": "reject"}], "final": "direct"},
+            # ip_is_private sees only literal or already resolved addresses. Resolve
+            # first, or a name such as localhost reaches loopback, link-local or a
+            # private network through "direct"; the outbound then dials exactly
+            # these checked addresses instead of resolving the name again.
+            "route": {"rules": [{"action": "resolve"}, {"ip_is_private": True, "action": "reject"}], "final": "direct"},
         }
         if active:
             config["inbounds"] = [
@@ -296,10 +309,11 @@ class Helper:
         target = self.layout.workers / (worker_id + ".json")
         checked_path(target, self.layout.trusted_uid, missing=True)
         descriptor, temporary = tempfile.mkstemp(prefix=".validate-", suffix=".json", dir=self.layout.workers)
+        encoded = json.dumps(config, separators=(",", ":")).encode()
         try:
             os.fchmod(descriptor, 0o600)
             with os.fdopen(descriptor, "wb") as stream:
-                stream.write(json.dumps(config, separators=(",", ":")).encode()); stream.flush(); os.fsync(stream.fileno())
+                stream.write(encoded); stream.flush(); os.fsync(stream.fileno())
             self._run([str(self.layout.core), "check", "-c", temporary])
             os.replace(temporary, target)
             parent = os.open(self.layout.workers, os.O_RDONLY | os.O_DIRECTORY)
@@ -307,6 +321,47 @@ class Helper:
             finally: os.close(parent)
         finally:
             if os.path.exists(temporary): os.unlink(temporary)
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _guard_proof(self, policy, worker_id, generation, mode, config_sha256, *, previous=None, process_id=None):
+        directory = checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True)
+        if previous is None:
+            prepared = time.monotonic_ns()
+        else:
+            prepared = previous['prepared_monotonic_ns']
+        proof = {'version': 1, 'server_id': policy['server_id'], 'worker_id': worker_id, 'generation': generation,
+                 'mode': mode, 'phase': 'prepared' if process_id is None else 'complete',
+                 'config_sha256': config_sha256, 'process_id': process_id, 'boot_id': machine_boot_id(),
+                 'prepared_monotonic_ns': prepared, 'observed_monotonic_ns': time.monotonic_ns()}
+        atomic_bytes(self.layout.guard_proofs / (worker_id + '.json'),
+                     json.dumps(proof, sort_keys=True, separators=(',', ':')).encode() + b'\n',
+                     mode=0o640, trusted_uid=self.layout.trusted_uid, gid=directory.st_gid)
+        return proof
+
+    def _guarded(self, policy, worker):
+        # v2 members always need root proofs. Under v1 the reviewed live handoff
+        # creates the proof directory together with the per-member guards.
+        if worker['role'] != 'member':
+            approval = self.layout.etc / 'admin-budget-guard.json'
+            if checked_path(approval, self.layout.trusted_uid, missing=True) is None:
+                return False  # Keep legacy unlimited administrator independent.
+            value = read_json(approval, self.layout.trusted_uid)
+            admins = [key for key,row in policy['workers'].items() if row['role']=='admin']
+            if (not {'server_id','worker_id','approved'}.issubset(value) or set(value)-{'server_id','worker_id','approved','boot_id','reviewed_unit_sha256'} or value.get('server_id') != policy['server_id'] or
+                    value.get('worker_id') not in admins or value.get('approved') is not True):
+                raise HelperError('POLICY','Administrator budget guard approval is invalid')
+            checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True)
+            return True
+        if policy['version'] == 2:
+            checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True)
+            return True
+        return checked_path(self.layout.guard_proofs, self.layout.trusted_uid, directory=True, missing=True) is not None
+
+    def _remove_guard_proof(self, worker_id):
+        path = self.layout.guard_proofs / (worker_id + '.json')
+        if path.exists() or path.is_symlink():
+            checked_path(path, self.layout.trusted_uid)
+            path.unlink()
 
     def _data(self, policy, worker_id, worker, record, actual, *, origin=False):
         if record.get("tombstoned"):
@@ -334,7 +389,16 @@ class Helper:
             action, generation, params = request["action"], request["generation"], request["params"]
             if action not in VERBS or type(generation) is not int or generation < 0 or generation > 2**63 - 1 or not isinstance(params, dict):
                 raise HelperError("VALIDATION", "Invalid helper operation")
-            if action in {"provision", "stage", "activate"}: credentials = validate_credentials(params)
+            lease_id = None
+            if action in {"provision", "stage", "activate"}:
+                typed = dict(params)
+                lease_id = canonical_uuid(typed.pop("lease_id", worker_id))
+                credentials = validate_credentials(typed)
+            elif action == "release":
+                if set(params) != {"lease_id"}:
+                    raise HelperError("VALIDATION", "Release requires exactly its ended authorisation")
+                lease_id = canonical_uuid(params["lease_id"])
+                credentials = None
             elif params: raise HelperError("VALIDATION", "This operation accepts no parameters")
             else: credentials = None
             with self.serialized():
@@ -348,7 +412,7 @@ class Helper:
                 else: registry = {"version": 1, "server_id": policy["server_id"], "workers": {}}
                 if registry.get("version") != 1 or registry.get("server_id") != policy["server_id"] or not isinstance(registry.get("workers"), dict):
                     raise HelperError("STATE", "Root registry identity mismatch")
-                record = registry["workers"].setdefault(worker_id, {"generation": 0, "mode": "unprovisioned", "tombstoned": False})
+                record = registry["workers"].setdefault(worker_id, {"generation": 0, "mode": "unprovisioned", "tombstoned": False, "lease_id": None})
                 actual = self._actual(worker_id, worker)
                 if action == "status":
                     return self._response(identifier, self._data(policy, worker_id, worker, record, actual))
@@ -363,7 +427,7 @@ class Helper:
                         raise HelperError("STALE_GENERATION", "Worker generation was already used")
                     if operation.get("status") == "complete":
                         prior = operation["response"]
-                        if action in {"stop", "revoke"} and not actual["inactive"]:
+                        if action in {"stop", "revoke", "release"} and not actual["inactive"]:
                             raise HelperError("STOP_FAILED", "Owned worker cgroup is no longer inactive")
                         if prior["managed_origin_zero"] and (not actual["active"] or actual["pid"] != prior["process_id"]):
                             raise HelperError("RECOVERY_REQUIRED", "Worker origin changed after the completed operation")
@@ -372,7 +436,33 @@ class Helper:
                         raise HelperError("RECOVERY_REQUIRED", "Interrupted activation requires an explicit owned stop")
                 elif generation != record["generation"] + 1:
                     raise HelperError("STALE_GENERATION", "Worker generation must advance exactly once")
-                if record.get("tombstoned") and action not in {"revoke", "stop"}:
+                retired = registry.setdefault("retired_authorizations", {})
+                if not isinstance(retired, dict):
+                    raise HelperError("STATE", "Retired authorisation registry is invalid")
+                current_lease = record.get("lease_id", worker_id)
+                if lease_id and worker_id + ":" + lease_id in retired:
+                    raise HelperError("REVOKED", "A retired authorisation can never be reused")
+                if credentials:
+                    for ended in retired.values():
+                        fingerprints = ended.get('credential_fingerprints', {})
+                        if any(fingerprints.get(key) == hashlib.sha256(credentials[key].encode()).hexdigest()
+                               for key in ('vless_uuid', 'tuic_uuid', 'tuic_password')):
+                            raise HelperError('REVOKED', 'Retired proxy credentials cannot be assigned to another lease')
+                if action == "release":
+                    # An authorisation can be revoked before its queued first
+                    # provision reaches root. No root lease exists in that case;
+                    # accept its tombstone only if this resource has never held
+                    # keys or credentials since its last confirmed release.
+                    never_issued = current_lease is None and not any(
+                        key in record for key in ("credentials", "private_key", "public_key"))
+                    if (worker['role'] != 'member' or not record.get('tombstoned') or
+                            (current_lease != lease_id and not never_issued) or not actual['inactive'] or
+                            record.get('mode') != 'revoked' or operation.get('status') != 'complete'):
+                        raise HelperError("RELEASE_UNCONFIRMED", "Only a confirmed inactive revoked assignment can be released")
+                elif lease_id and current_lease != lease_id:
+                    if action != "provision" or current_lease is not None or record.get("mode") != "unprovisioned" or not actual["inactive"]:
+                        raise HelperError("LEASE_MISMATCH", "Worker belongs to another authorisation")
+                if record.get("tombstoned") and action not in {"revoke", "stop", "release"}:
                     raise HelperError("REVOKED", "Permanently revoked worker cannot be started")
                 if action in {"stage", "activate"} and not record.get("private_key"):
                     raise HelperError("STATE", "Worker must be provisioned before starting")
@@ -386,7 +476,21 @@ class Helper:
                 atomic_json(self.layout.registry, registry, self.layout.trusted_uid)
                 try:
                     origin = False
-                    if action == "provision":
+                    if action == "release":
+                        # The old authorisation remains permanently tombstoned;
+                        # only the already inactive physical resource is vacant.
+                        retired[worker_id + ":" + lease_id] = {"tombstoned": True, "generation": generation,
+                            "credential_sha256": hashlib.sha256(json.dumps(record.get('credentials', {}), sort_keys=True).encode()).hexdigest(),
+                            "credential_fingerprints": {key: hashlib.sha256(value.encode()).hexdigest() for key,value in record.get('credentials', {}).items()}}
+                        record.update(lease_id=None,mode='unprovisioned',tombstoned=False)
+                        for name in ('credentials','private_key','public_key'):
+                            record.pop(name, None)
+                        target = self.layout.workers / (worker_id + '.json')
+                        if target.exists():
+                            checked_path(target, self.layout.trusted_uid)
+                            target.unlink()
+                        self._remove_guard_proof(worker_id)
+                    elif action == "provision":
                         if actual["active"]:
                             raise HelperError("STATE", "Stop the worker before provisioning")
                         if not record.get("private_key"):
@@ -398,21 +502,31 @@ class Helper:
                             except (ValueError, KeyError, UnicodeError):
                                 raise HelperError("EXECUTION", "Proxy key generation failed") from None
                             record.update(private_key=private_key, public_key=public_key)
-                        record.update(credentials=credentials, mode="provisioned")
+                        record.update(credentials=credentials, mode="provisioned", lease_id=lease_id)
                     elif action in {"stage", "activate"}:
+                        guarded = self._guarded(policy, worker)
                         if action == "activate":
                             checked_path(self.layout.tls_certificate, self.layout.trusted_uid)
                             checked_path(self.layout.tls_key, self.layout.trusted_uid)
                         config = self._config(worker_id, worker, credentials, record["private_key"], active=action == "activate")
-                        self._install_config(worker_id, config, policy)
+                        config_sha256 = self._install_config(worker_id, config, policy)
+                        proof = None
+                        if guarded:
+                            proof = self._guard_proof(policy, worker_id, generation,
+                                                      'running' if action == 'activate' else 'staged', config_sha256)
                         record.update(credentials=credentials, mode="running" if action == "activate" else "staged")
                         atomic_json(self.layout.registry, registry, self.layout.trusted_uid)
                         self._run(["/usr/bin/systemctl", "restart", self._unit(worker_id, worker)])
                         actual = self._actual(worker_id, worker)
                         if not actual["active"]: raise HelperError("START_FAILED", "Owned worker did not become active")
+                        if proof is not None:
+                            self._guard_proof(policy, worker_id, generation, proof['mode'], config_sha256,
+                                              previous=proof, process_id=actual['pid'])
                         origin = True
                     else:
                         actual = self._stop(worker_id, worker)
+                        if self.layout.guard_proofs.exists():
+                            self._remove_guard_proof(worker_id)
                         record["mode"] = "revoked" if record.get("tombstoned") else "stopped"
                     record["operation"]["status"] = "complete"
                     data = self._data(policy, worker_id, worker, record, actual, origin=origin)

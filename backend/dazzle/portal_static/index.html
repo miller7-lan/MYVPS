@@ -1,26 +1,26 @@
 <!doctype html>
 <html lang="zh-CN">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Dazzle'VPS · 私人共享</title><link rel="stylesheet" href="/portal/assets/app.css"><script src="/portal/assets/app.js" defer></script></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>Dazzle'VPS · 个人服务</title><link rel="stylesheet" href="/portal/assets/app.css"><script src="/portal/assets/app.js" defer></script></head>
 <body>
-<header class="top"><a class="brand" href="/portal/">Dazzle<span>'VPS</span></a><span class="pill">私人共享</span><button id="logout" class="quiet" hidden>退出登录</button></header>
+<header class="top"><a class="brand" href="/portal/">Dazzle<span>'VPS</span></a><span class="pill">个人服务</span><button id="logout" class="quiet" hidden>退出登录</button></header>
 <main>
  <section id="login" class="welcome">
-  <div class="intro"><span class="eyebrow">你的专属连接</span><h1>用邮箱登录，<br>等待管理员启用。</h1><p class="lead">订阅属于你，权限由管理员确认。<br>无需另设密码，也无需提供邮箱授权码。</p><ol class="steps"><li><span>1</span>验证邮箱</li><li><span>2</span>领取订阅</li><li><span>3</span>等待启用</li></ol></div>
-  <div class="card auth"><div class="section-title"><span class="icon">✉</span><div><h2>欢迎使用</h2><p>首次验证即完成注册，已有用户直接登录。</p></div></div>
+  <div class="intro"><span class="eyebrow">你的个人中心</span><h1>登录，<br>查看账户状态。</h1><p class="lead">验证邮箱后，即可查看账户状态。<br>首次申请需管理员审核，无需另设密码。</p><ol class="steps"><li><span>1</span>验证邮箱</li><li><span>2</span>查看状态</li><li><span>3</span>查收邮件</li></ol></div>
+  <div class="card auth"><div class="section-title"><span class="icon">✉</span><div><h2>欢迎使用</h2><p>验证邮箱后即可登录，首次申请需等待审核。</p></div></div>
+   <p id="capacity-note" class="notice" role="status" hidden></p>
    <form id="email-form"><label for="email">邮箱地址</label><input id="email" type="email" autocomplete="email" placeholder="name@example.com" maxlength="254" required><label for="nickname">昵称 <span class="optional">选填</span></label><input id="nickname" autocomplete="nickname" placeholder="管理员如何称呼你" maxlength="40"><div class="trap" aria-hidden="true"><label for="website">网站</label><input id="website" tabindex="-1" autocomplete="off"></div><button type="submit" class="primary">获取邮箱验证码 <span>→</span></button></form>
    <form id="code-form" hidden><p class="sent-to" id="sent-to"></p><label for="code">6 位验证码</label><input id="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required><button type="submit" class="primary">验证并登录 <span>→</span></button><button type="button" id="change-email" class="quiet">修改邮箱或重新获取</button></form>
-   <p class="fine">验证码10分钟内有效。QQ接受发信请求后，实际送达仍以收件箱为准；请同时检查垃圾邮件。</p>
+   <p class="fine">验证码10分钟内有效。无需提供邮箱密码或授权码；未收到时请检查垃圾邮件，稍后重试。</p>
   </div>
  </section>
  <section id="account" hidden>
   <div class="account-title"><div><span class="eyebrow">个人连接中心</span><h1 id="greeting">你好</h1><p id="account-email" class="muted"></p></div><button id="refresh" class="quiet">刷新状态 ↻</button></div>
-  <div class="overview"><div class="card status-card"><div><span id="status-badge" class="badge">等待启用</span><h2 id="status-title">订阅已准备好</h2><p id="status-description">管理员启用后，同一链接即可导入。</p></div><div class="status-orbit" aria-hidden="true">↗</div></div><div class="card usage-card"><svg class="meter" viewBox="0 0 88 88" aria-hidden="true"><circle class="track" cx="44" cy="44" r="36"></circle><circle id="usage-arc" cx="44" cy="44" r="36" stroke-dasharray="0 227"></circle></svg><div><span class="eyebrow">本周期用量</span><h2 id="used">尚未开通</h2><p id="quota" class="muted">额度由管理员分配</p></div></div></div>
-  <div class="section-title subscriptions-heading"><div><h2>你的订阅</h2><p>两种客户端，各自使用对应地址。</p></div><span class="muted small">常用 · VLESS / 迅速 · TUIC v5</span></div>
-  <div class="subscriptions"><article class="card subscription"><div class="client-heading"><span class="client-icon">C</span><div><h3>Clash / mihomo</h3><p>适用于 Clash Verge Rev 等兼容客户端</p></div></div><input id="clash-link" readonly aria-label="Clash订阅地址"><div class="actions"><button data-copy="clash" class="primary">复制订阅</button><button data-qr="clash" class="quiet">二维码</button></div></article><article class="card subscription"><div class="client-heading"><span class="client-icon rocket">S</span><div><h3>Shadowrocket</h3><p>在订阅管理中添加此地址</p></div></div><input id="shadowrocket-link" readonly aria-label="Shadowrocket订阅地址"><div class="actions"><button data-copy="shadowrocket" class="primary">复制订阅</button><button data-qr="shadowrocket" class="quiet">二维码</button></div></article></div>
-  <p class="notice">审核前链接不会返回节点，客户端可能提示无法更新。等待启用后，使用原地址重新导入或更新。订阅含访问凭据，请勿公开转发。</p>
+  <div class="card status-card"><div><span id="status-badge" class="badge">等待启用</span><h2 id="status-title">申请已提交</h2><p id="status-description">管理员实际开通后，你会收到使用资料邮件。</p></div><div class="status-orbit" aria-hidden="true">↗</div></div>
+  <div class="section-title subscriptions-heading"><div><h2>使用资料</h2><p>使用资料会发送至已验证邮箱，请查看邮件。</p></div><span class="muted small" id="valid-until">有效期以账户状态为准</span></div>
+  <p class="notice">开通后会收到使用资料邮件。如未收到，请先检查垃圾邮件；账户已启用时可点击下方按钮，重新发送到已验证邮箱。请妥善保管邮件中的个人链接，勿公开或转发。</p>
+  <button id="resend" class="primary" type="button" hidden>重新发送订阅邮件 <span>→</span></button>
  </section>
  <p id="message" role="status" aria-live="polite" hidden></p>
 </main>
-<dialog id="qr-dialog"><button id="close-qr" class="quiet close" aria-label="关闭二维码">×</button><h2 id="qr-title">订阅二维码</h2><img id="qr-image" alt="个人订阅二维码" width="256" height="256"><p class="fine">请在管理员启用后导入</p></dialog>
-<footer>Dazzle'VPS <span>·</span> 邮箱验证完成注册，管理员确认后启用</footer>
+<footer>Dazzle’VPS <span>·</span> 账户状态，一处查看</footer>
 </body></html>

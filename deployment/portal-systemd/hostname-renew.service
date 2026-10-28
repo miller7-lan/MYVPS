@@ -1,0 +1,28 @@
+[Unit]
+Description=Renew only the portal hostname certificate and validate its separate copy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+ExecStart=/opt/qqg-certbot/bin/certbot renew --quiet --standalone --cert-name @HOSTNAME@ --no-random-sleep-on-renew --no-directory-hooks
+ExecStartPost=/opt/dazzle-vps/current/venv/bin/python -I -m deployment.certsync --managed-certbot-source --hostname @HOSTNAME@ --source-cert /etc/letsencrypt/live/@HOSTNAME@/fullchain.pem --source-key /etc/letsencrypt/live/@HOSTNAME@/privkey.pem
+TimeoutStartSec=300
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt /etc/dazzle-vps/web-tls
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=192M
+TasksMax=32

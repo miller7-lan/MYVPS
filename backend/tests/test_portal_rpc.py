@@ -11,6 +11,7 @@ import uuid
 
 from dazzle.portal_rpc import PortalExecutor, MAX_MESSAGE, dispatch
 from dazzle.production_state import CORE_SHA256, ProductionStore
+from test_authorization_fixtures import seed_legacy_user
 
 
 class PortalSocketTests(unittest.TestCase):
@@ -109,7 +110,8 @@ class PortalSocketTests(unittest.TestCase):
             response = dispatch(reader,self.envelope("session.me", {"session_token":session}))
             self.assertTrue(response["ok"], response)
             self.assertEqual(response["data"]["account"]["id"],identifier)
-            self.assertTrue(response["data"]["subscriptions"]["clash"].endswith("/config.yaml"))
+            self.assertNotIn("subscriptions", response["data"])
+            self.assertEqual(response["data"]["delivery"]["method"], "email")
             response = dispatch(reader,self.envelope("subscription.fetch", {"token":token, "route":"config.yaml"}))
             self.assertEqual(response["data"]["status"],403)
             self.assertEqual(reader.conn.total_changes,0)
@@ -129,7 +131,7 @@ class PortalSocketTests(unittest.TestCase):
                 "params":params,"server_id":self.store.server_id,"expected_revision":self.store.revision},now)
             self.assertTrue(response["ok"],response)
             return response["data"]
-        user=rpc("user.add",{"name":"Readonly rendering", "role":"member","quota_bytes":100000})["user"]["id"]
+        user=seed_legacy_user(self.store,{"name":"Readonly rendering", "role":"member","quota_bytes":100000},now)["id"]
         helper=StrictHelper(self.policy,self.store)
         for _ in range(2):self.assertTrue(process_one_job(self.store,helper,now=now)["applied"])
         worker=self.store.worker(user)

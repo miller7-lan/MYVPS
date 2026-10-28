@@ -2,6 +2,7 @@
 import base64
 import asyncio
 import json
+from http.cookies import SimpleCookie
 import os
 from pathlib import Path
 import shutil
@@ -32,12 +33,17 @@ class FakeClient:
         self.calls = []
         self.active = False
         self.fail = False
+        self.full = False
 
     def call(self, operation, params, peer_ip):
         self.calls.append((operation, params, peer_ip))
         if self.fail:
             raise RuntimeError("private fixture must not be exposed")
-        if operation == "auth.request_code":
+        if operation == "registration.status":
+            data = {"enabled": True, "full": self.full, "accepting": not self.full, "message": "人员已满，稍后再试" if self.full else ""}
+        elif operation == "auth.request_code":
+            if self.full:
+                return {"ok": False, "error": {"code": "REGISTRATION_FULL"}}
             data = {"challenge_id": "challenge-fixture"}
         elif operation == "auth.verify":
             data = {"session_token": SESSION_VALUE, "expires_at": "2026-12-01T00:00:00Z"}
@@ -45,8 +51,18 @@ class FakeClient:
             data = {"account": {"id": "self", "email": "person@example.com", "nickname": "<script>fixture</script>", "status": "active" if self.active else "pending", "proxy_user_id": "self" if self.active else None,
                     "quota_bytes": 100_000_000_000, "used_upload": 0, "used_download": 0},
                     "subscriptions": {"clash": ORIGIN + "/" + TOKEN + "/config.yaml", "shadowrocket": ORIGIN + "/" + TOKEN + "/nodes.txt"}}
+        elif operation == "session.resend_subscription":
+            if not self.active:
+                return {"ok": False, "error": {"code": "NOT_ACTIVE"}}
+            data = {"queued": True, "email": "person@example.com"}
         elif operation == "session.logout":
             data = {"logged_out": True}
+        elif operation == "session.subscription":
+            if not self.active:
+                return {"ok": False, "error": {"code": "NOT_ACTIVE"}}
+            data = {"filename": "config.yaml" if params["format"] == "clash" else "nodes.txt",
+                    "content": "proxies: []\n" if params["format"] == "clash" else "vless://fixture\n",
+                    "node_names": ["VLESS（常用）", "TUIC v5（迅速）"]}
         elif operation == "subscription.fetch":
             status = 404 if params["token"] != TOKEN else 200 if self.active else 403
             data = {"status": status, "headers": {"Subscription-Userinfo": "upload=0; download=0; total=100000000000", "Set-Cookie": "untrusted=1"},
@@ -71,21 +87,81 @@ class PortalWebTests(unittest.TestCase):
     def login(self):
         return self.post("verify", {"challenge_id": "fixture", "code": "123456"})
 
+    def test_registration_status_is_a_read_only_get_and_full_seats_show_the_message(self):
+        status = self.client.get("/portal/api/status")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["data"]["accepting"], True)
+        self.assertEqual(self.client.post("/portal/api/status", json={}).status_code, 405)
+        self.assertEqual(self.backend.calls[-1][:2], ("registration.status", {}))
+        self.backend.full = True
+        self.assertTrue(self.client.get("/portal/api/status").json()["data"]["full"])
+        refused = self.post("request-code", {"email": "person@example.com"})
+        self.assertEqual(refused.status_code, 400)
+        self.assertEqual(refused.json()["error"], {"code": "REGISTRATION_FULL", "message": "人员已满，稍后再试"})
+        page = self.client.get("/portal/").text
+        script = self.client.get("/portal/assets/app.js").text
+        self.assertIn('id="capacity-note"', page)
+        self.assertIn("人员已满，稍后再试", script)
+        self.assertIn('api("status")', script)
+
     def test_static_has_security_headers_and_no_third_party_assets(self):
         response = self.client.get("/portal/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers["cache-control"], "no-store")
-        self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+        # same-origin, never no-referrer: older mobile engines derive Origin from it.
+        self.assertEqual(response.headers["referrer-policy"], "same-origin")
         self.assertIn("frame-ancestors 'none'", response.headers["content-security-policy"])
         self.assertNotIn("https://", response.text)
         for name in ("app.css", "app.js"):
             self.assertEqual(self.client.get("/portal/assets/" + name).status_code, 200)
         self.assertEqual(self.client.get("/portal/assets/other.js").status_code, 404)
 
+    def test_one_address_cannot_drive_unbounded_api_work_into_the_agent(self):
+        for _ in range(60):
+            self.assertEqual(self.client.get("/portal/api/status").status_code, 200)
+        calls = len(self.backend.calls)
+        for refused in (self.client.get("/portal/api/status"), self.post("request-code", {"email": "person@example.com"})):
+            self.assertEqual(refused.status_code, 429)
+            self.assertEqual(refused.json()["error"]["code"], "RATE_LIMITED")
+        self.assertEqual(len(self.backend.calls), calls)
+
     def test_cross_origin_and_missing_csrf_rejected_before_ipc(self):
         self.assertEqual(self.post("request-code", {"email": "person@example.com"}, headers={"Origin": "https://outside.example"}).status_code, 403)
         self.assertEqual(self.client.post("/portal/api/request-code", json={"email": "person@example.com"}).status_code, 403)
         self.assertFalse(self.backend.calls)
+
+    def test_signed_in_resend_is_a_csrf_protected_post_carrying_only_the_session(self):
+        self.assertEqual(self.post("resend-subscription", {}).status_code, 401)
+        self.assertEqual(self.login().status_code, 200)
+        self.assertEqual(self.post("resend-subscription", {}).json()["error"]["code"], "NOT_ACTIVE")
+        self.backend.active = True
+        reply = self.post("resend-subscription", {})
+        self.assertEqual((reply.status_code, reply.json()["data"]), (200, {"queued": True, "email": "person@example.com"}))
+        self.assertEqual(self.backend.calls[-1][:2], ("session.resend_subscription", {"session_token": SESSION_VALUE}))
+        calls = len(self.backend.calls)
+        self.assertEqual(self.post("resend-subscription", {"email": "elsewhere@example.com"}).status_code, 400)
+        self.assertEqual(self.client.get("/portal/api/resend-subscription").status_code, 405)
+        self.assertEqual(self.post("resend-subscription", {}, headers={"X-CSRF-Token": "d" * 43}).status_code, 403)
+        self.assertEqual(len(self.backend.calls), calls)
+
+    def test_page_named_challenge_is_passed_to_the_agent(self):
+        chosen = "0b5c4f53-5a4e-4f7c-9a8e-3c4b2a1d0e9f"
+        self.assertEqual(self.post("request-code", {"email": "person@example.com", "challenge_id": chosen}).status_code, 200)
+        self.assertEqual(self.backend.calls[-1][1], {"email": "person@example.com", "challenge_id": chosen})
+
+    def test_browser_can_read_csrf_cookie_and_request_verification(self):
+        page = self.client.get("/portal/")
+        cookies = SimpleCookie()
+        cookies.load(page.headers["set-cookie"])
+        csrf_cookie = cookies[CSRF]
+        browser_token = "" if csrf_cookie["httponly"] else csrf_cookie.value
+        response = self.client.post("/portal/api/request-code",
+                                    json={"email": "person@example.com", "nickname": "Private"},
+                                    headers={"Origin": ORIGIN, "X-CSRF-Token": browser_token})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(csrf_cookie["secure"])
+        self.assertEqual(csrf_cookie["samesite"], "lax")
+        self.assertEqual(csrf_cookie["path"], "/portal")
 
     def test_host_spoofing_rejected(self):
         self.assertEqual(self.client.get("/portal/", headers={"Host": "outside.example"}).status_code, 400)
@@ -119,7 +195,10 @@ class PortalWebTests(unittest.TestCase):
         self.login()
         data = self.client.get("/portal/api/me").json()["data"]
         self.assertEqual(data["account"]["id"], "self")
-        self.assertEqual(data["subscriptions"]["clash"], ORIGIN + "/" + TOKEN + "/config.yaml")
+        self.assertEqual(data["delivery"], {"method": "email"})
+        self.assertEqual(set(data["account"]), {"id", "email", "nickname", "status", "expires_at"})
+        for private in ("subscriptions", "quota_bytes", "used_upload", "used_download", TOKEN):
+            self.assertNotIn(private, json.dumps(data))
         self.assertNotIn("users", data)
 
     def test_same_subscription_path_pending_then_active(self):
@@ -151,14 +230,14 @@ class PortalWebTests(unittest.TestCase):
             self.assertIn(self.client.post(path, json={}).status_code, (404, 405))
         self.assertFalse(self.backend.calls)
 
-    def test_qr_requires_own_session_and_is_local_svg(self):
-        self.assertEqual(self.client.get("/portal/qr/clash").status_code, 401)
+    def test_removed_web_qr_and_config_cannot_disclose_links_even_when_signed_in(self):
+        self.assertEqual(self.client.get("/portal/qr/clash").status_code, 404)
         self.login()
-        response = self.client.get("/portal/qr/clash")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("image/svg+xml", response.headers["content-type"])
-        self.assertNotIn(b"<script", response.content)
-        self.assertEqual(self.client.get("/portal/qr/other").status_code, 404)
+        self.backend.active = True
+        self.backend.calls.clear()
+        for path in ("/portal/qr/clash", "/portal/qr/shadowrocket", "/portal/config/clash", "/portal/config/shadowrocket?download=1"):
+            self.assertEqual(self.client.get(path).status_code, 404)
+        self.assertFalse(self.backend.calls)
 
     def test_logout_clears_cookie_and_get_cannot_logout(self):
         self.login()
@@ -176,7 +255,7 @@ class PortalWebTests(unittest.TestCase):
 
     def test_subscription_only_rollback_retains_subscriptions(self):
         client = TestClient(create_app(origin=ORIGIN, client=self.backend, portal_enabled=False), base_url=ORIGIN)
-        for path in ("/portal/", "/portal/assets/app.js", "/portal/api/me", "/portal/qr/clash"):
+        for path in ("/portal/", "/portal/assets/app.js", "/portal/api/me", "/portal/qr/clash", "/portal/config/clash"):
             self.assertEqual(client.get(path).status_code, 404)
         self.assertEqual(client.get("/" + TOKEN + "/config.yaml").status_code, 403)
 
@@ -287,6 +366,59 @@ class FrontendSessionTests(unittest.TestCase):
         result = subprocess.run(["node", str(Path(__file__).with_name("portal_browser_state.js")),
                                  str(Path(__file__).parents[1] / "dazzle/portal_static/app.js")], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for isolated frontend logic test")
+    def test_phone_flow_survives_a_lost_reply_and_a_reload_and_offers_resend(self):
+        result = subprocess.run(["node", str(Path(__file__).with_name("portal_mobile_flow.js")),
+                                 str(Path(__file__).parents[1] / "dazzle/portal_static/app.js")], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for isolated frontend logic test")
+    def test_page_explains_a_closed_registration_the_identical_reply_cannot(self):
+        for state in ("closed", "accepting"):
+            with self.subTest(state=state):
+                result = subprocess.run(["node", str(Path(__file__).with_name("portal_closed_notice.js")),
+                                         str(Path(__file__).parents[1] / "dazzle/portal_static/app.js"), state],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+
+@unittest.skipUnless(AVAILABLE and shutil.which("openssl"), "Portal extras and OpenSSL required")
+class TLSCipherTests(unittest.TestCase):
+    def handshake(self, server_ciphers, cert, key):
+        server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); server.minimum_version = ssl.TLSVersion.TLSv1_2
+        server.set_ciphers(server_ciphers); server.load_cert_chain(cert, key)
+        client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); client.check_hostname = False; client.verify_mode = ssl.CERT_NONE
+        # A TLS 1.2-only engine that offers AEAD suites alone.
+        client.minimum_version = client.maximum_version = ssl.TLSVersion.TLSv1_2
+        client.set_ciphers("ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305")
+        pipes = [ssl.MemoryBIO() for _ in range(4)]
+        ends = {"server": server.wrap_bio(pipes[0], pipes[1], server_side=True), "client": client.wrap_bio(pipes[2], pipes[3])}
+        done = set()
+        try:
+            for _ in range(20):
+                for name, end in ends.items():
+                    if name not in done:
+                        try:
+                            end.do_handshake(); done.add(name)
+                        except ssl.SSLWantReadError:
+                            pass
+                pipes[0].write(pipes[3].read()); pipes[2].write(pipes[1].read())
+                if done == set(ends):
+                    return ends["client"].cipher()[0]
+        except ssl.SSLError:
+            return None
+        return None
+
+    def test_tls12_clients_offering_only_aead_suites_can_connect(self):
+        from dazzle.portal import TLS_CIPHERS
+        with tempfile.TemporaryDirectory() as folder:
+            cert, key = Path(folder) / "cert.pem", Path(folder) / "key.pem"
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                            "-keyout", str(key), "-out", str(cert), "-days", "1", "-subj", "/CN=203.0.113.10"],
+                           check=True, capture_output=True)
+            self.assertIsNone(self.handshake("TLSv1", cert, key))  # uvicorn's default list, used before.
+            self.assertIn("GCM", self.handshake(TLS_CIPHERS, cert, key))
 
 
 @unittest.skipUnless(AVAILABLE and shutil.which("openssl"), "Portal extras and OpenSSL required")

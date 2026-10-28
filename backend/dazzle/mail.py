@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime
+from .mail_templates import render as render_mail
 
 
 DEFAULT_PREFERENCES = {"enabled": True, "cooldown_seconds": 3600, "max_attempts": 5}
@@ -269,6 +270,9 @@ def claim_messages(store, now, *, worker_id, limit=20, lease_seconds=60):
 
 
 def _still_authorized(store, message, now):
+    if message["kind"] == "subscription_resend":
+        from .registration import authorize_subscription_email
+        return authorize_subscription_email(store, message, now)
     if message["kind"] in {"portal_verification", "portal_welcome", "portal_review", "portal_activated"}:
         from .registration import authorize_mail
         return authorize_mail(store, message, now)
@@ -357,12 +361,20 @@ def process_outbox(store, now, *, limit=20, worker_id=None, delivery=None):
     return result
 
 
-def _smtp_send(config, message, *, password=None, allow_live=False, smtp_factory=None, smtp_ssl_factory=None):
+def _smtp_send(config, message, *, password=None, allow_live=False, smtp_factory=None, smtp_ssl_factory=None, private_body=None):
     """TLS submission; callers must explicitly enable and provide the secret."""
     if not allow_live:
         raise MailDeliveryError("LIVE_TRANSPORT_DISABLED", retryable=False)
     if config.get("security") not in ("ssl", "starttls"):
         raise MailDeliveryError("TLS_ERROR", retryable=False)
+    body = _safe_text(message["body"])
+    if private_body is not None:
+        # This opt-in comes only from the durable private payload after current
+        # account/token authorization. Ordinary caller messages stay redacted.
+        if (message.get("kind") not in {"portal_activated", "subscription_resend"} or
+                not isinstance(private_body, str) or len(private_body) > 10000):
+            raise MailDeliveryError("PRIVATE_PAYLOAD_INVALID", retryable=False)
+        body = private_body
     context = ssl.create_default_context()
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
@@ -387,7 +399,7 @@ def _smtp_send(config, message, *, password=None, allow_live=False, smtp_factory
                 email["Message-ID"] = "<dazzle-" + message["id"] + "@" + config["sender"].rsplit("@", 1)[-1] + ">"
             if message.get("created_at"):
                 email["Date"] = format_datetime(_parse(message["created_at"]))
-            email.set_content(_safe_text(message["body"]))
+            email.set_content(body)
             rejected = client.send_message(email)
             if isinstance(rejected, dict) and rejected:
                 raise MailDeliveryError("RECIPIENT_REJECTED", retryable=False)
@@ -490,9 +502,9 @@ def handle_live_mail(store, action, params, now):
         if not _config(store)[0]:
             return {"queued": False, "reason": "smtp_secret_required" if _config(store)[2] else "smtp_not_configured"}
         if action == "mail.test":
+            template = render_mail("test")
             return enqueue_notification(store, event_key="test:" + uuid.uuid4().hex, user_id=params.get("user_id"),
-                                        kind="test", subject="Dazzle VPS 测试通知",
-                                        body="这是一封服务器邮件配置测试通知。SMTP 接受不等于最终进入收件箱；本邮件不含代理凭据或订阅链接。", now=now)
+                                        kind="test", subject=template.subject, body=template.body, now=now)
         identity, email, user_id = _identity(store, params)
         existing = store.conn.execute("SELECT sent_at FROM mail_verifications WHERE identity=?", (identity,)).fetchone()
         if existing and (now - _parse(existing["sent_at"])).total_seconds() < VERIFY_COOLDOWN_SECONDS:
@@ -503,10 +515,10 @@ def handle_live_mail(store, action, params, now):
                            (identity, email, salt, code_hash, _iso(now + timedelta(seconds=VERIFY_TTL_SECONDS)), _iso(now)))
         if user_id:
             store.conn.execute("UPDATE users SET email=?,email_verified=0,updated_at=? WHERE id=?", (email, _iso(now), user_id))
+        template = render_mail("verification", code=code)
         result = _enqueue(store, event_key="verify:" + uuid.uuid4().hex, user_id=user_id, cycle_id=None,
-                          recipient=email, kind="verification", subject="Dazzle VPS 邮箱验证码",
-                          body="邮箱验证通知；验证码仅用于发往已配置收件人的私密邮件。", now=now,
-                          private_body=f"您的邮箱验证码：{code}\n10分钟内有效，最多尝试5次。如非本人操作请忽略。")
+                          recipient=email, kind="verification", subject=template.subject,
+                          body=template.public_body, now=now, private_body=template.body)
         return {**result, "expires_at": _iso(now + timedelta(seconds=VERIFY_TTL_SECONDS)), "state": "queued"}
     raise ValueError("This mail action is unavailable in production")
 
@@ -532,14 +544,24 @@ def process_live_outbox(store, now=None, *, delivery=None):
             store.conn.commit()
             return {"processed": 0, "state": "idle"}
         message = claimed[0]
-        if not _still_authorized(store, message, now):
+        try:
+            authorized = _still_authorized(store, message, now)
+        except Exception:
+            authorized = None
+        payload = store.conn.execute("SELECT body FROM mail_private_payload WHERE outbox_id=?", (message["id"],)).fetchone()
+        private = message["kind"] in {"verification", "portal_verification", "portal_welcome", "portal_activated", "subscription_resend"}
+        if authorized is None or (authorized and private and payload is None):
+            # Fail closed for this message alone. Raising rolled the claim back,
+            # so the same oldest message blocked every later code indefinitely.
+            store.conn.execute("UPDATE mail_outbox SET status='dead',completed_at=?,error_code='DELIVERY_FAILED',lease_owner=NULL,lease_until=NULL WHERE id=?", (_iso(now), message["id"]))
+            store.conn.execute("DELETE FROM mail_private_payload WHERE outbox_id=?", (message["id"],))
+            store.conn.commit()
+            return {"processed": 1, "state": "dead"}
+        if not authorized:
             store.conn.execute("UPDATE mail_outbox SET status='cancelled',completed_at=?,error_code='RECIPIENT_NO_LONGER_AUTHORIZED',lease_owner=NULL,lease_until=NULL WHERE id=?", (_iso(now), message["id"]))
             store.conn.execute("DELETE FROM mail_private_payload WHERE outbox_id=?", (message["id"],))
             store.conn.commit()
             return {"processed": 1, "state": "cancelled"}
-        payload = store.conn.execute("SELECT body FROM mail_private_payload WHERE outbox_id=?", (message["id"],)).fetchone()
-        if message["kind"] in {"verification", "portal_verification", "portal_welcome", "portal_activated"} and payload is None:
-            raise ValueError("Private verification payload is unavailable")
         if payload is not None:
             message["body"] = payload["body"]
         secret = secret_row["secret"]
@@ -550,7 +572,8 @@ def process_live_outbox(store, now=None, *, delivery=None):
     failure = None
     try:
         if delivery is None:
-            _smtp_send(config, message, password=secret, allow_live=True)
+            _smtp_send(config, message, password=secret, allow_live=True,
+                       private_body=message["body"] if payload is not None and message["kind"] in {"portal_activated", "subscription_resend"} else None)
         else:
             delivery(config, message, secret)
     except MailDeliveryError as exc:
@@ -678,10 +701,11 @@ def handle_mail(store, action, params, now):
         )
         if user_id:
             store.conn.execute("UPDATE users SET email=?,email_verified=0,updated_at=? WHERE id=?", (email, _iso(now), user_id))
+        template = render_mail("verification", code=code)
         result = _enqueue(store, event_key="verify:" + uuid.uuid4().hex, user_id=user_id, cycle_id=None,
-                          recipient=email, kind="verification", subject="DAZZLE 邮箱验证（本地模拟）",
-                          body="验证码内容仅保存在隔离的本地模拟邮箱，普通界面不可读取。", now=now,
-                          private_body=f"您的邮箱验证码：{code}\n10分钟内有效，最多尝试5次。本邮件来自本地模拟，不会实际发送。")
+                          recipient=email, kind="verification", subject=template.subject + "（本地模拟）",
+                          body=template.public_body, now=now,
+                          private_body=template.body + "\n\n本邮件来自本地模拟，不会实际发送。")
         return {**result, "expires_at": _iso(now + timedelta(seconds=VERIFY_TTL_SECONDS)), "state": "simulated"}
     if action == "mail.verify.confirm":
         identity, email, user_id = _identity(store, params)
@@ -707,9 +731,10 @@ def handle_mail(store, action, params, now):
     if action == "mail.test":
         if not _config(store)[0]:
             raise ValueError("Configure mail simulation before testing")
+        template = render_mail("test")
         return enqueue_notification(store, event_key="test:" + uuid.uuid4().hex, user_id=params.get("user_id"),
-                                    kind="test", subject="DAZZLE 测试通知（本地模拟）",
-                                    body="邮件通知配置测试。不包含代理凭据、订阅地址或服务器密码。此邮件仅进入本地模拟队列，未实际发送。", now=now)
+                                    kind="test", subject=template.subject + "（本地模拟）",
+                                    body="此邮件仅进入隔离的本地模拟队列，未实际发送。\n\n" + template.body, now=now)
     if action == "mail.process":
         return process_outbox(store, now, limit=params.get("limit", 20))
     raise ValueError("Unsupported mail action")

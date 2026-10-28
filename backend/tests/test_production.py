@@ -17,6 +17,7 @@ from dazzle.production import (ALLOWED_ACTIONS, ProductionError, accept_sample, 
                                plan_jobs, process_one_job, refresh_worker_status, render_export,
                                snapshot, subscription_response)
 from dazzle.production_state import CORE_SHA256, ProductionStore, validate_policy
+from test_authorization_fixtures import confirm_test_budget, seed_legacy_user
 from dazzle.store import Store, parse_time, timestamp, utcnow
 
 PUBLIC_KEY = "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0"
@@ -103,7 +104,8 @@ class ProductionTests(unittest.TestCase):
         return result
 
     def add(self, role="member", quota=1000):
-        return self.call("user.add", {"name": "Parallel test " + role, "role": role, "quota_bytes": quota})["data"]["user"]["id"]
+        # These byte-scale tests exercise existing proxy/ledger behaviour.
+        return seed_legacy_user(self.store, {"name": "Parallel test " + role, "role": role, "quota_bytes": quota}, self.now)["id"]
 
     def process(self, seconds=0):
         return process_one_job(self.store, self.helper, now=self.now + dt.timedelta(seconds=seconds))
@@ -136,6 +138,17 @@ class ProductionTests(unittest.TestCase):
         self.assertTrue(self.process()["applied"])
         self.assertEqual(self.store.worker(user)["observed_state"], "running")
         return user
+
+    def test_timezone_is_stored_exactly_as_validated(self):
+        # Validation stripped the value but the raw one was stored, so the next
+        # cycle boundary failed to load " Asia/Tokyo " and stopped the writer tick.
+        self.call("settings.update", {"timezone": " Asia/Tokyo "})
+        self.assertEqual(self.store.get_setting("timezone"), "Asia/Tokyo")
+        for value in ("Not/AZone", "../../etc/passwd", "   "):
+            with self.subTest(value=value):
+                self.assertEqual(self.call("settings.update", {"timezone": value}, ok=False)["error"]["code"], "VALIDATION")
+        self.assertEqual(self.store.get_setting("timezone"), "Asia/Tokyo")
+        self.assertTrue(tick(self.store, self.now + dt.timedelta(days=40))["transitioned"])
 
     def test_initialization_explicit_separate_and_root_identity_bound(self):
         state = snapshot(self.store, self.now)
@@ -192,6 +205,7 @@ class ProductionTests(unittest.TestCase):
         self.assertEqual(snapshot(self.store, self.now)["users"], [])
 
     def test_manual_request_retry_is_durable_and_idempotent(self):
+        confirm_test_budget(self.store, self.now)
         identifier = str(uuid.uuid4())
         first = self.call("user.add", {"name": "Idempotent"}, request_id=identifier)
         again = self.call("user.add", {"name": "Idempotent"}, request_id=identifier)

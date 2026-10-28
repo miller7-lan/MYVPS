@@ -141,4 +141,4 @@ def worker_template(user: dict, credentials: dict, *, reality_private_key: str,
                      "certificate_path": "/etc/s-box/cert.pem", "key_path": "/etc/s-box/private.key"}}
         ],
         "outbounds": [{"type": "direct", "tag": "direct"}],
-        "route": {"rules": [{"ip_is_private": True, "action": "reject"}], "final": "direct"}}
+        "route": {"rules": [{"action": "resolve"}, {"ip_is_private": True, "action": "reject"}], "final": "direct"}}

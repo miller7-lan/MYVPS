@@ -7,8 +7,8 @@ import base64
 from contextlib import asynccontextmanager, suppress
 import hashlib
 import hmac
-import io
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -25,6 +25,7 @@ from starlette.responses import Response, JSONResponse
 from starlette.routing import Route
 from uvicorn.protocols.http.h11_impl import H11Protocol
 from .production import RateLimit
+from .production_state import checked_hostname
 
 SOCKET_PATH = "/run/dazzle-vps-portal/agent.sock"
 SESSION = "__Secure-dazzle_session"
@@ -34,8 +35,16 @@ MAX_REPLY = 3_000_000
 ASSETS = Path(__file__).with_name("portal_static")
 MESSAGES = {"INVALID_CODE": "验证码错误、已使用或已过期，请重新获取。",
             "UNAUTHENTICATED": "请先通过邮箱验证码登录。", "RATE_LIMITED": "请求较频繁，请稍后再试。",
-            "REGISTRATION_CLOSED": "暂不接受新注册，已有用户仍可登录。", "UNAVAILABLE": "服务暂时不可用，请稍后重试。",
+            "REGISTRATION_CLOSED": "暂不接受新注册，已有用户仍可登录。", "REGISTRATION_FULL": "人员已满，稍后再试",
+            "UNAVAILABLE": "服务暂时不可用，请稍后重试。",
+            "NOT_ACTIVE": "此账户尚未启用或已暂停，暂不能获取使用资料。",
+            "RESEND_COOLDOWN": "刚刚已发送过，请稍后再试（每5分钟最多一次，每天最多5次）。",
+            "MAIL_NOT_CONFIGURED": "暂时无法发送邮件，请联系管理员。",
+            "EMAIL_NOT_VERIFIED": "邮箱尚未验证，请联系管理员。",
             "VALIDATION": "请检查邮箱及填写内容。"}
+# TLS 1.3 suites are unaffected. TLS 1.2 previously inherited uvicorn's "TLSv1"
+# list, which offers no AEAD suite; keep forward secrecy first and CBC fallbacks.
+TLS_CIPHERS = "ECDHE+AESGCM:ECDHE+CHACHA20:ECDHE+AES:AES:!aNULL:!eNULL:!MD5:!DSS:!3DES"
 
 
 class PortalUnavailable(Exception):
@@ -156,6 +165,29 @@ def reload_tls(context, certificate, key, previous=None):
         return previous
 
 
+class HostCertificate:
+    """A hostname's own pair. Clients connecting by IP send no SNI and keep the default."""
+    def __init__(self, certificate, key):
+        self.paths = (certificate, key)
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.minimum_version = ssl.TLSVersion.TLSv1_2
+        self.context.set_ciphers(TLS_CIPHERS)
+        self.fingerprint = None
+        self.reload()
+
+    def reload(self):
+        self.fingerprint = reload_tls(self.context, *self.paths, self.fingerprint)
+
+
+def select_certificate(hosts):
+    """SNI callback: switch to a hostname's pair only once that pair has loaded."""
+    def select(connection, server_name, _context):
+        entry = hosts.get((server_name or "").rstrip(".").lower())
+        if entry is not None and entry.fingerprint is not None:
+            connection.context = entry.context
+    return select
+
+
 class SafetyHeaders:
     def __init__(self, app):
         self.app, self.state, self.routes = app, app.state, app.routes
@@ -168,7 +200,9 @@ class SafetyHeaders:
             nonlocal started, completed
             if message["type"] == "http.response.start":
                 started = True
-                security = {b"cache-control": b"no-store", b"referrer-policy": b"no-referrer", b"x-content-type-options": b"nosniff",
+                # same-origin, not no-referrer: some mobile engines apply the
+                # page's referrer policy to Origin and send "null" on its own POSTs.
+                security = {b"cache-control": b"no-store", b"referrer-policy": b"same-origin", b"x-content-type-options": b"nosniff",
                     b"content-security-policy": b"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
                     b"permissions-policy": b"camera=(), microphone=(), geolocation=()", b"x-frame-options": b"DENY"}
                 message["headers"] = [(key, value) for key, value in message.get("headers", []) if key.lower() not in security] + list(security.items())
@@ -186,10 +220,17 @@ class SafetyHeaders:
 
 
 def create_app(*, origin, client=None, portal_enabled=True):
-    origin = normalized_origin(origin, allow_loopback_http=True)
+    # One origin per served name (the IP and an optional hostname); links issued with either keep working.
+    origins = frozenset(normalized_origin(value, allow_loopback_http=True)
+                        for value in ([origin] if isinstance(origin, str) else origin))
+    if not origins:
+        raise ValueError("An explicit HTTPS origin is required")
     client = client or PortalClient()
     semaphore = asyncio.Semaphore(8)
     limiter = RateLimit(limit=100, window=60)
+    # A page load needs two API calls and sign-in a few more. Bound what one
+    # address can make the agent process before any per-account budget applies.
+    api_limiter = RateLimit(limit=60, window=60)
 
     async def invoke(request, operation, params):
         peer = request.client.host if request.client else "127.0.0.1"
@@ -203,7 +244,9 @@ def create_app(*, origin, client=None, portal_enabled=True):
         if not portal_enabled:
             return Response(status_code=404)
         result = Response((ASSETS / "index.html").read_bytes(), media_type="text/html")
-        _secure_cookie(result, CSRF, secrets.token_urlsafe(32), max_age=604800)
+        # The same-origin client echoes this token in a request header. Session
+        # authentication remains HttpOnly; only this anti-forgery cookie is readable.
+        _secure_cookie(result, CSRF, secrets.token_urlsafe(32), max_age=604800, httponly=False)
         return result
 
     async def asset(request):
@@ -216,16 +259,19 @@ def create_app(*, origin, client=None, portal_enabled=True):
         if not portal_enabled:
             return Response(status_code=404)
         action = request.path_params["action"]
-        operations = {"request-code": "auth.request_code", "verify": "auth.verify", "me": "session.me", "logout": "session.logout"}
+        operations = {"status": "registration.status", "request-code": "auth.request_code", "verify": "auth.verify", "me": "session.me",
+                      "resend-subscription": "session.resend_subscription", "logout": "session.logout"}
         if action not in operations:
             return Response(status_code=404)
-        if request.method != ("GET" if action == "me" else "POST"):
+        if request.method != ("GET" if action in {"me", "status"} else "POST"):
             return Response(status_code=405)
+        if not api_limiter.allow(request.client.host if request.client else "127.0.0.1"):
+            return _error("RATE_LIMITED", 429)
         params = {}
         if request.method == "POST":
             csrf = request.cookies.get(CSRF, "")
             supplied = request.headers.get("x-csrf-token", "")
-            if (request.headers.get("origin") != origin or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", csrf)
+            if (request.headers.get("origin") not in origins or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", csrf)
                     or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", supplied) or not hmac.compare_digest(csrf, supplied)):
                 return _error("VALIDATION", 403)
             if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
@@ -238,7 +284,8 @@ def create_app(*, origin, client=None, portal_enabled=True):
                         if len(data) > MAX_BODY:
                             return _error("VALIDATION", 413)
                 params = json.loads(data)
-                allowed = {"request-code": {"email", "nickname", "website"}, "verify": {"challenge_id", "code"}, "logout": set()}[action]
+                allowed = {"request-code": {"email", "nickname", "website", "challenge_id"}, "verify": {"challenge_id", "code"},
+                           "resend-subscription": set(), "logout": set()}[action]
                 if not isinstance(params, dict) or set(params) - allowed:
                     return _error("VALIDATION")
                 if action == "request-code" and params.pop("website", ""):
@@ -249,7 +296,7 @@ def create_app(*, origin, client=None, portal_enabled=True):
                 result = _error("VALIDATION", 408)
                 result.headers["Connection"] = "close"
                 return result
-        if action in {"me", "logout"}:
+        if action in {"me", "resend-subscription", "logout"}:
             token = request.cookies.get(SESSION, "")
             if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
                 return _error("UNAUTHENTICATED", 401)
@@ -259,6 +306,11 @@ def create_app(*, origin, client=None, portal_enabled=True):
             code = reply.get("error", {}).get("code", "UNAVAILABLE")
             return _error(code, {"UNAUTHENTICATED": 401, "RATE_LIMITED": 429, "UNAVAILABLE": 503}.get(code, 400))
         data = reply["data"]
+        if action == "me":
+            account = data.get("account", {})
+            data = {"account": {key: account.get(key) for key in
+                                ("id", "email", "nickname", "status", "expires_at")},
+                    "delivery": {"method": "email"}}
         if action == "verify":
             result = JSONResponse({"ok": True, "data": {"expires_at": data["expires_at"]}})
             _secure_cookie(result, SESSION, data["session_token"], max_age=604800)
@@ -267,27 +319,6 @@ def create_app(*, origin, client=None, portal_enabled=True):
         if action == "logout":
             result.delete_cookie(SESSION, path="/portal", secure=True, httponly=True, samesite="lax")
         return result
-
-    async def qr(request):
-        if not portal_enabled:
-            return Response(status_code=404)
-        format_name = request.path_params["format"]
-        if format_name not in {"clash", "shadowrocket"}:
-            return Response(status_code=404)
-        token = request.cookies.get(SESSION, "")
-        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
-            return Response(status_code=401)
-        reply = await invoke(request, "session.me", {"session_token": token})
-        if not reply.get("ok"):
-            return Response(status_code=401)
-        link = reply["data"].get("subscriptions", {}).get(format_name)
-        if not isinstance(link, str) or not link.startswith(origin + "/"):
-            return Response(status_code=403)
-        import qrcode
-        import qrcode.image.svg
-        image = qrcode.make(link, image_factory=qrcode.image.svg.SvgPathImage)
-        output = io.BytesIO(); image.save(output)
-        return Response(output.getvalue(), media_type="image/svg+xml")
 
     async def subscription(request):
         token, route = request.path_params["token"], request.path_params["route"]
@@ -313,6 +344,8 @@ def create_app(*, origin, client=None, portal_enabled=True):
             while True:
                 if getattr(app.state, "tls_context", None):
                     previous = await asyncio.to_thread(reload_tls, app.state.tls_context, *app.state.tls_paths, previous)
+                for entry in getattr(app.state, "host_tls", {}).values():
+                    await asyncio.to_thread(entry.reload)
                 await asyncio.sleep(15)
         task = asyncio.create_task(watch_tls())
         try:
@@ -324,8 +357,8 @@ def create_app(*, origin, client=None, portal_enabled=True):
 
     app = Starlette(routes=[Route("/portal", index), Route("/portal/", index),
                             Route("/portal/assets/{name}", asset), Route("/portal/api/{action}", api, methods=["GET", "POST"]),
-                            Route("/portal/qr/{format}", qr), Route("/{token}/{route}", subscription)], lifespan=lifespan)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=[urlsplit(origin).hostname])
+                            Route("/{token}/{route}", subscription)], lifespan=lifespan)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=sorted({urlsplit(value).hostname for value in origins}))
 
     return SafetyHeaders(app)
 
@@ -339,20 +372,32 @@ def main():
     parser.add_argument("--cert", required=True)
     parser.add_argument("--key", required=True)
     parser.add_argument("--subscription-only", action="store_true")
+    # Set by an optional unit drop-in, so the unit's own command line never changes.
+    parser.add_argument("--hostname", default=os.environ.get("DAZZLE_PORTAL_HOSTNAME") or None,
+                        help="DNS name also served on this port; its pair is host-cert.pem/host-key.pem beside --cert/--key")
     args = parser.parse_args()
-    origin = normalized_origin(args.origin)
+    origins = [normalized_origin(args.origin)]
     if args.port != 9443 or args.socket != SOCKET_PATH:
         parser.error("Only the approved subscription port and private socket are supported")
+    if args.hostname:
+        try:
+            origins.append(f"https://{checked_hostname(args.hostname)}:{args.port}")
+        except ValueError:
+            parser.error("--hostname must be a lowercase DNS name")
     import uvicorn
-    app = create_app(origin=origin, client=PortalClient(args.socket), portal_enabled=not args.subscription_only)
+    app = create_app(origin=origins, client=PortalClient(args.socket), portal_enabled=not args.subscription_only)
     config = uvicorn.Config(app, host=args.host, port=args.port, ssl_certfile=args.cert, ssl_keyfile=args.key,
-                            ssl_version=ssl.PROTOCOL_TLS_SERVER, workers=1, limit_concurrency=16, backlog=32,
+                            ssl_version=ssl.PROTOCOL_TLS_SERVER, ssl_ciphers=TLS_CIPHERS, workers=1, limit_concurrency=16, backlog=32,
                             timeout_keep_alive=5, server_header=False, access_log=False, proxy_headers=False, log_level="warning",
                             http=DeadlineH11Protocol, loop="dazzle.portal:loop_factory", h11_max_incomplete_event_size=16384)
     config.load()
     config.ssl.minimum_version = ssl.TLSVersion.TLSv1_2
     app.state.tls_context = config.ssl
     app.state.tls_paths = (args.cert, args.key)
+    if args.hostname:
+        app.state.host_tls = {args.hostname: HostCertificate(str(Path(args.cert).with_name("host-cert.pem")),
+                                                             str(Path(args.key).with_name("host-key.pem")))}
+        config.ssl.sni_callback = select_certificate(app.state.host_tls)
     uvicorn.Server(config).run()
 
 

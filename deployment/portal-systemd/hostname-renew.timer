@@ -1,0 +1,10 @@
+[Unit]
+Description=Check only the portal hostname certificate twice daily
+
+[Timer]
+OnCalendar=*-*-* 01,13:00:00 UTC
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

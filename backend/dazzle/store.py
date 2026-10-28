@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('member','admin')),
- port INTEGER NOT NULL UNIQUE, manual_disabled INTEGER NOT NULL DEFAULT 1,
+ port INTEGER NOT NULL, manual_disabled INTEGER NOT NULL DEFAULT 1,
  reasons_json TEXT NOT NULL DEFAULT '[]', quota_bytes INTEGER, unlimited INTEGER NOT NULL DEFAULT 0,
  topup_bytes INTEGER NOT NULL DEFAULT 0, used_upload INTEGER NOT NULL DEFAULT 0,
  used_download INTEGER NOT NULL DEFAULT 0, credential_version INTEGER NOT NULL DEFAULT 1,
@@ -79,6 +79,9 @@ CREATE TABLE IF NOT EXISTS ledger (
  epoch TEXT NOT NULL, upload INTEGER NOT NULL, download INTEGER NOT NULL,
  sample_at TEXT NOT NULL, created_at TEXT NOT NULL
 );
+-- The budget refresh sums the current cycle on every 0.5s writer tick. Covering
+-- the sum keeps that cost bounded by one cycle instead of the whole history.
+CREATE INDEX IF NOT EXISTS ledger_cycle_usage ON ledger(cycle_id,upload,download);
 CREATE TABLE IF NOT EXISTS metering_incidents (
  id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), kind TEXT NOT NULL,
  previous_epoch TEXT, sample_epoch TEXT, previous_at TEXT, sample_at TEXT,
@@ -161,6 +164,8 @@ class Store:
             except sqlite3.OperationalError:
                 if "deleted_at" not in {row[1] for row in self.conn.execute("PRAGMA table_info(users)")}:
                     raise
+        self._migrate_port_history()
+        self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_live_user_per_port ON users(port) WHERE revoked_at IS NULL AND deleted_at IS NULL")
         self.conn.execute("BEGIN IMMEDIATE")
         try:
             for key, value in DEFAULT_SETTINGS.items():
@@ -174,10 +179,63 @@ class Store:
                 ensure_schema = None
             if ensure_schema is not None:
                 ensure_schema(self)
+            from .trials import ensure_schema as ensure_trials
+            ensure_trials(self)
+            from .budget import ensure_schema as ensure_budget
+            ensure_budget(self)
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
             raise
+
+    def _migrate_port_history(self):
+        """Keep every archived row, allow only live assignments to share no port.
+
+        SQLite cannot drop an inline UNIQUE constraint. Rebuild in one locked
+        transaction, with foreign keys checked before committing. No data is
+        removed and no old authorisation is made live by this migration.
+        """
+        indexes = self.conn.execute("PRAGMA index_list(users)").fetchall()
+        old = any(row[2] and row[3] == "u" and
+                  [entry[2] for entry in self.conn.execute('PRAGMA index_info("' + row[1].replace('"', '""') + '")')] == ["port"]
+                  for row in indexes)
+        if not old:
+            return
+        # DROP TABLE removes its explicit indexes and triggers as well. Keep
+        # their original SQL verbatim, including formatting: the deployment
+        # migration checker requires every existing schema object to survive.
+        objects = [row[0] for row in self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name='users' AND type IN ('index','trigger') "
+            "AND sql IS NOT NULL ORDER BY type,name")]
+        foreign_keys = self.conn.execute("PRAGMA foreign_keys").fetchone()[0]
+        legacy_alter = self.conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        # Existing views temporarily refer to users while the table is rebuilt.
+        # Do not rewrite or reject those unchanged definitions during rename.
+        self.conn.execute("PRAGMA legacy_alter_table=ON")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            sql = self.conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()[0]
+            definition = sql.replace("CREATE TABLE users", "CREATE TABLE users_port_migration", 1)
+            definition = definition.replace("port INTEGER NOT NULL UNIQUE", "port INTEGER NOT NULL")
+            if definition == sql or "port INTEGER NOT NULL UNIQUE" in definition:
+                raise ValueError("Unknown user schema; port history migration refused")
+            self.conn.execute(definition)
+            self.conn.execute("INSERT INTO users_port_migration SELECT * FROM users")
+            self.conn.execute("DROP TABLE users")
+            self.conn.execute("ALTER TABLE users_port_migration RENAME TO users")
+            for sql in objects:
+                self.conn.execute(sql)
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_live_user_per_port ON users(port) WHERE revoked_at IS NULL AND deleted_at IS NULL")
+            if self.conn.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("User history migration did not preserve foreign keys")
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.execute("PRAGMA legacy_alter_table=" + str(int(legacy_alter)))
+            self.conn.execute("PRAGMA foreign_keys=" + str(int(foreign_keys)))
 
     @classmethod
     def preview(cls, state_dir: str | Path, *, now: dt.datetime | None = None) -> "Store":
@@ -216,7 +274,12 @@ class Store:
         row = self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if row is None:
             raise KeyError("User not found")
-        return dict(row)
+        result = dict(row)
+        if self.conn.execute("SELECT 1 FROM sqlite_master WHERE name='trials'").fetchone():
+            trial = self.conn.execute("SELECT expires_at,ended_at FROM trials WHERE user_id=?", (user_id,)).fetchone()
+            if trial:
+                result.update(authorization_expires_at=trial[0], authorization_ended_at=trial[1])
+        return result
 
     def get_credentials(self, user_id: str) -> dict:
         row = self.conn.execute("SELECT * FROM credentials WHERE user_id=?", (user_id,)).fetchone()

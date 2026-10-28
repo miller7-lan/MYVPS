@@ -17,7 +17,7 @@ from .store import utcnow
 
 SOCKET_PATH = "/run/dazzle-vps-portal/agent.sock"
 MAX_MESSAGE = 16384
-READ_OPERATIONS = frozenset({"session.me", "subscription.fetch"})
+READ_OPERATIONS = frozenset({"registration.status", "session.me", "session.subscription", "subscription.fetch"})
 
 
 def peer_uid(connection):
