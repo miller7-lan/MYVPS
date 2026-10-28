@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+[ "${RENEWED_LINEAGE:-}" = /etc/letsencrypt/live/qqg-ip ] || exit 0
+/usr/bin/systemctl start dazzle-vps-certsync.service
