@@ -67,6 +67,8 @@ struct RegistrationsPage: View {
     }
     private var accountList: some View {
         Card {
+            Text("已拒绝申请保留 72 小时，到期自动清理。")
+                .font(.caption2).foregroundStyle(VPSTheme.muted)
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(VPSTheme.muted)
                 TextField("搜索昵称或邮箱", text: $search).textFieldStyle(.plain)
@@ -131,6 +133,9 @@ struct RegistrationsPage: View {
                 NoticeBox(icon: "arrow.triangle.2.circlepath", text: "正在准备独立实例和可信计量。订阅暂不返回可用节点。")
             } else if account.canApprove {
                 NoticeBox(icon: "lock", text: "邮箱已绑定，等待你启用。实际开通后，系统将邮件发送两条订阅链接。")
+            }
+            if let deadline = account.raw["rejected_delete_at"].string {
+                NoticeBox(icon: "clock", text: "已拒绝 · 将于 " + Display.date(.string(deadline)) + " 自动清理申请记录。")
             }
             if account.canApprove && !store.budget.canAllocate {
                 NoticeBox(icon: "lock.shield", text: store.budget.reason, tint: .orange)

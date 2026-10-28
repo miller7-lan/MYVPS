@@ -217,9 +217,10 @@ def tick(store, now=None):
         trials.advance(store, now)
         recovery.advance(store, now)
         plan_jobs(store, now)
-        from .registration import queue_activation_notices
+        from .registration import prune_rejected, queue_activation_notices
+        pruned = prune_rejected(store, now)
         queue_activation_notices(store, now)
-        if result["transitioned"]:
+        if result["transitioned"] or pruned:
             store.set_meta("revision", store.revision + 1)
         store.conn.commit()
     except BaseException:
