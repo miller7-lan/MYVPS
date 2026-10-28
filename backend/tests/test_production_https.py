@@ -1,9 +1,13 @@
 """Token-only HTTP boundaries and TLS context reload, entirely local fixtures."""
 import http.client
 import io
+import shutil
+import socket
 import ssl
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from http.server import ThreadingHTTPServer
@@ -11,7 +15,66 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from dazzle.production import RateLimit, SubscriptionServer, TLSContexts, subscription_handler
+from dazzle.production import DeadlineStream, RateLimit, SubscriptionServer, TLSContexts, subscription_handler
+
+
+def _certificate(folder):
+    cert, key = Path(folder) / "cert.pem", Path(folder) / "key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+                    "-days", "1", "-subj", "/CN=localhost"], capture_output=True, check=True)
+    return str(cert), str(key)
+
+
+def _tls(port):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    raw = socket.create_connection(("127.0.0.1", port), timeout=3)
+    try:
+        return context.wrap_socket(raw, server_hostname="localhost")
+    except BaseException:
+        raw.close()
+        raise
+
+
+def _fetch(port, path):
+    """A prompt, complete request; None when the server turns the connection away."""
+    try:
+        with _tls(port) as connection:
+            connection.sendall(f"GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode())
+            reply = b""
+            while chunk := connection.recv(4096):
+                reply += chunk
+            return reply or None
+    except OSError:
+        return None
+
+
+def _eventually(action, seconds=2):
+    """A slot is released just after its connection closes, so allow that moment to pass."""
+    stop = time.monotonic() + seconds
+    while (result := action()) is None and time.monotonic() < stop:
+        time.sleep(0.02)
+    return result
+
+
+def _trickle_until_closed(connections, limit):
+    """Extend each unfinished request line by one byte about every 0.1 s; note when each is closed."""
+    closed, stop = {}, time.monotonic() + limit
+    while len(closed) < len(connections) and time.monotonic() < stop:
+        for index, connection in enumerate(connections):
+            if index in closed:
+                continue
+            try:
+                connection.sendall(b"a")
+                connection.settimeout(0.05)
+                if connection.recv(1) == b"":
+                    closed[index] = time.monotonic()
+            except TimeoutError:
+                pass
+            except OSError:
+                closed[index] = time.monotonic()
+    return closed
 
 
 class ProductionHTTPSTests(unittest.TestCase):
@@ -72,6 +135,64 @@ class ProductionHTTPSTests(unittest.TestCase):
             close.assert_called_once_with(rejected)
         server.slots.release()
         server.slots.release()
+
+    def test_deadline_stream_never_arms_a_timeout_past_its_absolute_deadline(self):
+        clock = [100.0]
+        class Trickle:
+            def __init__(self):
+                self.timeouts = []
+            def settimeout(self, value):
+                self.timeouts.append(round(value, 6))
+            def recv_into(self, buffer):
+                clock[0] += 0.4  # One byte each time, always sooner than the idle timeout.
+                buffer[:1] = b"G"
+                return 1
+            def send(self, data):
+                clock[0] += 0.4
+                return 1
+        connection = Trickle()
+        stream = DeadlineStream(connection, 0.5, 1.0, 1.0, clock=lambda: clock[0])
+        with self.assertRaises(TimeoutError):
+            io.BufferedReader(stream).readline(65537)
+        self.assertEqual(connection.timeouts, [0.5, 0.5, 0.2])
+        connection.timeouts.clear()
+        self.assertEqual(stream.write(b"ok"), 2)  # The response budget starts with its first write ...
+        with self.assertRaises(TimeoutError):
+            stream.write(b"more")  # ... and later writes cannot extend it.
+        self.assertEqual(connection.timeouts, [0.5, 0.5, 0.2])
+
+    @unittest.skipUnless(shutil.which("openssl"), "OpenSSL required for loopback TLS test")
+    def test_trickled_headers_cannot_hold_slots_past_the_absolute_deadline(self):
+        handler = subscription_handler({}, "/nonexistent")
+        handler.idle_timeout, handler.header_timeout = 0.5, 1.5
+        with tempfile.TemporaryDirectory() as folder:
+            server = SubscriptionServer(("127.0.0.1", 0), handler, TLSContexts(*_certificate(folder)), max_connections=2)
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            attackers = []
+            try:
+                port = server.server_port
+                started = time.monotonic()
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as silent:
+                    self.assertEqual(silent.recv(1), b"")  # A silent client still ends at the idle timeout.
+                self.assertLess(time.monotonic() - started, handler.header_timeout)
+                started = time.monotonic()
+                for _ in range(2):
+                    attackers.append(_tls(port))
+                    attackers[-1].sendall(b"GET /")
+                self.assertIsNone(_fetch(port, "/not-a-route"))  # Every slot is held by a trickling client.
+                closed = _trickle_until_closed(attackers, limit=8)
+                self.assertEqual(len(closed), 2, "Trickled bytes kept their slots past the header deadline")
+                for moment in closed.values():
+                    self.assertGreater(moment - started, handler.idle_timeout)
+                    self.assertLess(moment - started, handler.header_timeout + 3)
+                self.assertRegex(_eventually(lambda: _fetch(port, "/not-a-route")) or b"", rb"^HTTP/1\.0 404 ")
+            finally:
+                for connection in attackers:
+                    connection.close()
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
 
     def test_unknown_routes_and_unsupported_methods_never_reflect_tokens(self):
         handler = subscription_handler({}, "/nonexistent")

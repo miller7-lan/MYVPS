@@ -1,14 +1,13 @@
 [Unit]
 Description=Dazzle private-sharing registration and subscription HTTPS endpoint
-After=network-online.target dazzle-vps-agent.service
+After=network-online.target
 Wants=network-online.target
-Requires=dazzle-vps-agent.service
 
 [Service]
 Type=exec
 User=dazzle-web
 Group=dazzle-web
-ExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m dazzle.portal --socket /run/dazzle-vps-portal/agent.sock --host 0.0.0.0 --port 9443 --cert /etc/dazzle-vps/web-tls/cert.pem --key /etc/dazzle-vps/web-tls/key.pem --origin @ORIGIN@
+ExecStart=/opt/dazzle-vps/current/venv/bin/python -I -m dazzle.portal --socket /run/dazzle-vps-portal/agent.sock --host 0.0.0.0 --port 9443 --cert /run/dazzle-vps-web-tls/cert.pem --key /run/dazzle-vps-web-tls/key.pem --origin @ORIGIN@
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10
@@ -16,6 +15,7 @@ UMask=0077
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 PrivateTmp=yes
+BindReadOnlyPaths=/etc/dazzle-vps/web-tls:/run/dazzle-vps-web-tls
 ProtectHome=yes
 ProtectSystem=strict
 ProtectKernelTunables=yes

@@ -16,6 +16,7 @@ from dazzle.production import handle_request, process_one_job, snapshot
 from dazzle.production_state import CORE_SHA256, ProductionStore
 from dazzle.store import parse_time
 from test_production import StrictHelper
+from test_authorization_fixtures import seed_legacy_user
 
 
 class LiveMailTests(unittest.TestCase):
@@ -106,7 +107,8 @@ class LiveMailTests(unittest.TestCase):
         def deliver(config, message, secret):
             self.assertFalse(self.store.conn.in_transaction)
             self.assertEqual(secret, self.secret)
-            self.assertIn("您的邮箱验证码", message["body"])
+            self.assertIn("验证码", message["body"])
+            self.assertRegex(message["body"], r"\b[0-9]{6}\b")
             with ProductionStore(self.directory.name, policy=self.policy) as other:
                 other.set_meta("delivery_progress", True)
             delivered.append(message["id"])
@@ -211,7 +213,7 @@ class LiveMailTests(unittest.TestCase):
                 executor.close()
 
     def test_delete_archives_user_keeps_ledger_and_root_tombstone_and_never_reuses_slot(self):
-        user = self.rpc("user.add", {"name": "Delete fixture", "role": "member"})["data"]["user"]["id"]
+        user = seed_legacy_user(self.store, {"name": "Delete fixture", "role": "member"}, self.now)["id"]
         self.store.conn.execute("UPDATE users SET used_upload=13,used_download=21 WHERE id=?", (user,))
         self.store.conn.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?,?,?)", ("fixture-ledger", user, "fixture-cycle", "fixture-epoch", 13, 21, "2026-11-01T08:19:00Z", "2026-11-01T08:19:00Z"))
         self.rpc("user.delete", {"user_id": user})
@@ -238,7 +240,7 @@ class LiveMailTests(unittest.TestCase):
 
     def test_delete_cancels_pending_verification_and_keeps_stop_pending_visible_in_archive(self):
         self.configure()
-        user = self.rpc("user.add", {"name": "Pending archive", "role": "member"})["data"]["user"]["id"]
+        user = seed_legacy_user(self.store, {"name": "Pending archive", "role": "member"}, self.now)["id"]
         self.rpc("user.update", {"user_id": user, "email": "member@example.test"})
         queued = self.rpc("mail.verify.send", {"user_id": user})["data"]
         self.assertTrue(self.store.conn.execute("SELECT 1 FROM mail_private_payload WHERE outbox_id=?", (queued["id"],)).fetchone())
@@ -253,7 +255,7 @@ class LiveMailTests(unittest.TestCase):
         self.assertIsNone(self.store.conn.execute("SELECT 1 FROM credentials WHERE user_id=?", (user,)).fetchone())
 
     def test_deleted_failed_root_stop_is_visible_in_archive(self):
-        user = self.rpc("user.add", {"name": "Failed archive", "role": "member"})["data"]["user"]["id"]
+        user = seed_legacy_user(self.store, {"name": "Failed archive", "role": "member"}, self.now)["id"]
         self.rpc("user.delete", {"user_id": user})
         process_one_job(self.store, self.helper, self.now)
         self.helper.failure = "STOP_FAILED"
@@ -263,8 +265,9 @@ class LiveMailTests(unittest.TestCase):
         self.assertEqual(archived["last_error"], "STOP_FAILED")
 
     def test_existing_user_ledger_and_metadata_survive_additive_schema_upgrade(self):
-        user = self.rpc("user.add", {"name": "Migration fixture", "role": "member"})["data"]["user"]["id"]
+        user = seed_legacy_user(self.store, {"name": "Migration fixture", "role": "member"}, self.now)["id"]
         self.store.conn.execute("UPDATE users SET used_upload=123,used_download=456 WHERE id=?", (user,))
+        self.store.conn.execute("DROP INDEX IF EXISTS one_live_user_per_port")
         self.store.conn.execute("ALTER TABLE users DROP COLUMN deleted_at")
         self.store.conn.execute("DROP TABLE mail_secrets")
         self.store.conn.execute("DROP TABLE mail_private_payload")
@@ -280,7 +283,7 @@ class LiveMailTests(unittest.TestCase):
 
     def test_live_quota_notifications_require_verified_member_and_do_not_claim_simulation(self):
         self.ready()
-        user = self.rpc("user.add", {"name": "Quota email fixture", "role": "member", "quota_bytes": 100})["data"]["user"]["id"]
+        user = seed_legacy_user(self.store, {"name": "Quota email fixture", "role": "member", "quota_bytes": 100}, self.now)["id"]
         self.rpc("user.update", {"user_id": user, "email": "member@example.test"})
         self.verify(user)
         self.store.conn.execute("UPDATE users SET used_upload=100 WHERE id=?", (user,))
@@ -293,7 +296,7 @@ class LiveMailTests(unittest.TestCase):
         self.assertIn("已请求暂停", rows[0]["body"])
 
     def test_production_reconcile_records_ssh_authenticated_administrator(self):
-        user = self.rpc("user.add", {"name": "Maintenance audit fixture", "role": "member"})["data"]["user"]["id"]
+        user = seed_legacy_user(self.store, {"name": "Maintenance audit fixture", "role": "member"}, self.now)["id"]
         domain._incident(self.store, self.store.get_user(user), "fixture_api_only_maintenance_gap", self.now)
         self.store.conn.execute("UPDATE users SET trusted_sample=1,last_sample_at=?,meter_state='reconciliation_required',reasons_json='[\"metering_failure\"]' WHERE id=?",
                                 (self.now.isoformat(), user))

@@ -325,6 +325,21 @@ class MailTests(unittest.TestCase):
         self.assertTrue(context.check_hostname)
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
 
+    def test_private_link_opt_in_is_restricted_and_ordinary_mail_remains_redacted(self):
+        factory = MagicMock()
+        client = factory.return_value.__enter__.return_value
+        client.send_message.return_value = {}
+        link = "https://example.test/private/config.yaml"
+        base = {"recipient": "a@example.com", "subject": "test", "kind": "notification", "body": link}
+        mail._smtp_send(self.config, base, password="mock-only", allow_live=True, smtp_ssl_factory=factory)
+        self.assertNotIn(link, client.send_message.call_args.args[0].get_content())
+        factory.reset_mock()
+        with self.assertRaises(mail.MailDeliveryError) as raised:
+            mail._smtp_send(self.config, base, password="mock-only", allow_live=True,
+                            smtp_ssl_factory=factory, private_body=link)
+        self.assertEqual(raised.exception.code, "PRIVATE_PAYLOAD_INVALID")
+        factory.assert_not_called()
+
     def test_tls_failure_is_safe_and_never_falls_back_to_plain(self):
         factory = MagicMock()
         client = factory.return_value.__enter__.return_value

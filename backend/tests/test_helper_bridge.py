@@ -14,6 +14,7 @@ from dazzle.metering import MeterSample
 from dazzle.production import (HelperClient, ProductionError, accept_sample, handle_request,
                                process_one_job, refresh_worker_status, snapshot)
 from dazzle.production_state import CORE_SHA256, ProductionStore
+from test_authorization_fixtures import seed_legacy_user
 from dazzle.store import parse_time, timestamp
 
 
@@ -108,8 +109,8 @@ class HelperBridgeTests(unittest.TestCase):
         return read_json(self.layout.registry, os.getuid())["workers"][self.worker_id]
 
     def stage(self):
-        added = self.rpc("user.add", {"name": "Parallel bridge fixture", "role": "member", "quota_bytes": 1000})
-        self.assertEqual(added["user"]["id"], self.worker_id)
+        historical = seed_legacy_user(self.store, {"name": "Parallel bridge fixture", "role": "member", "quota_bytes": 1000}, self.now)
+        self.assertEqual(historical["id"], self.worker_id)
         self.assertTrue(self.process()["applied"])
         self.assertTrue(self.process()["applied"])
         self.sample(seconds=1)

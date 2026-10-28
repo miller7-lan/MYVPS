@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import stat
 import uuid
@@ -18,6 +19,24 @@ TLS_CERT = "/etc/dazzle-vps/tls/cert.pem"
 TLS_KEY = "/etc/dazzle-vps/tls/key.pem"
 SUBSCRIPTION_PORT = 9443
 CORE_SHA256 = "1264361b5f8868c8768f7555d3e77e20118bf503c41ac08bb290a0d99056aa3a"
+# Lowercase DNS name whose last label starts with a letter, so IP literals never match.
+HOSTNAME = re.compile(r"(?=.{4,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def checked_hostname(value):
+    if not isinstance(value, str) or not HOSTNAME.fullmatch(value):
+        raise ValueError("A lowercase public DNS hostname is required")
+    return value
+
+
+def public_origin(store) -> str:
+    """Origin for portal and subscription links. Proxy nodes always keep the policy IP.
+
+    The hostname is an administrator setting applied only once the portal serves it with
+    its own certificate; links already issued with the IP stay valid either way.
+    """
+    host = store.get_setting("public_hostname") or store.policy["server_endpoint"]
+    return f"https://{host}:{SUBSCRIPTION_PORT}"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS production_workers (
@@ -153,6 +172,8 @@ class ProductionStore(Store):
                     raise ValueError("Registered worker binding changed")
                 self.conn.execute("INSERT OR IGNORE INTO production_workers(worker_id,role,public_port,api_port) VALUES(?,?,?,?)",
                                   (identifier, worker["role"], worker["public_port"], worker["api_port"]))
+            for row in self.conn.execute("SELECT worker_id,user_id FROM production_workers WHERE user_id IS NOT NULL").fetchall():
+                self.conn.execute("INSERT OR IGNORE INTO resource_leases(id,worker_id,user_id,status,created_at) VALUES(?,?,?,'active',?)", (row['user_id'],row['worker_id'],row['user_id'],self.get_user(row['user_id'])['created_at']))
             self.conn.commit()
         except BaseException:
             self.conn.rollback()
@@ -166,5 +187,8 @@ class ProductionStore(Store):
     def worker(self, user_id: str) -> dict:
         row = self.conn.execute("SELECT * FROM production_workers WHERE user_id=?", (user_id,)).fetchone()
         if row is None:
+            archived = self.conn.execute("SELECT worker_json FROM resource_leases WHERE user_id=? AND status='released'", (user_id,)).fetchone()
+            if archived and archived[0]:
+                return json.loads(archived[0])
             raise KeyError("No registered production worker")
         return dict(row)

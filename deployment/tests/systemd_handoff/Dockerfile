@@ -1,0 +1,10 @@
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive container=docker
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus python3 python3-venv ca-certificates procps passwd && rm -rf /var/lib/apt/lists/*
+RUN touch /etc/dazzle-handoff-isolated-container
+COPY deployment /workspace/deployment
+COPY backend /workspace/backend
+COPY third_party /workspace/third_party
+WORKDIR /workspace
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

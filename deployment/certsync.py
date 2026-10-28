@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy a validated legacy certificate pair into ONLY the new project namespace.
+"""Copy a validated, explicitly selected pair into ONLY the project namespace.
 
 Never invokes certbot/systemctl or writes the source paths. On validation failure
 the existing project pair remains intact. Two separate watched files are required
@@ -12,6 +12,8 @@ import grp
 import hashlib
 import json
 import os
+import re
+import stat
 from pathlib import Path
 import ssl
 import tempfile
@@ -20,19 +22,102 @@ from .helper import HelperError, Layout, Runner, atomic_bytes, atomic_json, chec
 
 SOURCE_CERT = Path("/etc/s-box/cert.pem")
 SOURCE_KEY = Path("/etc/s-box/private.key")
+CERTBOT_ROOT = Path("/etc/letsencrypt")
+# Same rule as dazzle.production_state.HOSTNAME; this root tool imports nothing from the backend.
+HOSTNAME = re.compile(r"(?=.{4,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+
+def _file_signature(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _read_regular(path, trusted_uid):
-    checked_path(path, trusted_uid)
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(descriptor, "rb") as stream:
-        contents = stream.read(256 * 1024 + 1)
+    before = checked_path(path, trusted_uid)
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != trusted_uid or
+                    opened.st_mode & 0o022 or opened.st_nlink != 1 or
+                    _file_signature(opened) != _file_signature(before)):
+                raise HelperError("TLS_INVALID", "Certificate material changed while opening")
+            contents = stream.read(256 * 1024 + 1)
+            if _file_signature(os.fstat(stream.fileno())) != _file_signature(opened):
+                raise HelperError("TLS_INVALID", "Certificate material changed while reading")
+    except OSError:
+        raise HelperError("TLS_INVALID", "Certificate material is unavailable") from None
     if not contents or len(contents) > 256 * 1024:
         raise HelperError("TLS_INVALID", "Certificate material exceeds its size limit")
     return contents
 
 
+def _managed_directories(path, root, trusted_uid):
+    # Root/UID injection exists only for isolated Python tests. The CLI always
+    # uses root-owned /etc/letsencrypt and checks every ancestor, including /etc.
+    ancestors = list(reversed(path.parents)) + [path]
+    if root != CERTBOT_ROOT or trusted_uid != 0:
+        ancestors = [parent for parent in ancestors if parent == root or root in parent.parents]
+    for parent in ancestors:
+        if parent == Path("/"):
+            continue
+        checked_path(parent, trusted_uid, directory=True)
+
+
+def _managed_pair_paths(source_cert, source_key, trusted_uid, certbot_root):
+    root = Path(certbot_root)
+    cert, key = Path(source_cert), Path(source_key)
+    if (not root.is_absolute() or ".." in root.parts or not cert.is_absolute() or
+            not key.is_absolute() or ".." in cert.parts or ".." in key.parts):
+        raise HelperError("TLS_INVALID", "Managed certificate paths must be explicit")
+    try:
+        cert_relative, key_relative = cert.relative_to(root), key.relative_to(root)
+    except ValueError:
+        raise HelperError("TLS_INVALID", "Managed certificate is outside the installed Certbot root") from None
+    if (len(cert_relative.parts) != 3 or len(key_relative.parts) != 3 or
+            cert_relative.parts[0] != "live" or key_relative.parts[0] != "live" or
+            cert_relative.parts[1] != key_relative.parts[1] or
+            cert_relative.parts[2] != "fullchain.pem" or key_relative.parts[2] != "privkey.pem"):
+        raise HelperError("TLS_INVALID", "Exactly one managed Certbot lineage is required")
+    name = cert_relative.parts[1]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}", name):
+        raise HelperError("TLS_INVALID", "Invalid Certbot lineage name")
+    archive = root / "archive" / name
+    _managed_directories(cert.parent, root, trusted_uid)
+    _managed_directories(archive, root, trusted_uid)
+    records = []
+    for source, prefix in ((cert, "fullchain"), (key, "privkey")):
+        try:
+            link_info = source.lstat()
+            if not stat.S_ISLNK(link_info.st_mode) or link_info.st_uid != trusted_uid:
+                raise HelperError("TLS_INVALID", "Managed live entries must be trusted Certbot symlinks")
+            link_text = os.readlink(source)
+            target = Path(os.path.abspath(source.parent / link_text))
+            if target.parent != archive:
+                raise HelperError("TLS_INVALID", "Managed live entry leaves its Certbot archive")
+            match = re.fullmatch(re.escape(prefix) + r"([1-9][0-9]*)\.pem", target.name)
+            if not match:
+                raise HelperError("TLS_INVALID", "Managed live entry has an unexpected archive filename")
+            target_info = checked_path(target, trusted_uid)
+            records.append((target, match.group(1), link_text,
+                            _file_signature(link_info), _file_signature(target_info)))
+        except OSError:
+            raise HelperError("TLS_INVALID", "Managed certificate source is unavailable") from None
+    if records[0][1] != records[1][1]:
+        raise HelperError("TLS_INVALID", "Managed certificate and key versions differ; retry after renewal completes")
+    return tuple(records)
+
+
 def validate_pair(cert_path, key_path, endpoint, runner):
+    _check_pair(cert_path, key_path, runner, ("-checkip", "-verify_ip"), endpoint)
+
+
+def validate_hostname_pair(cert_path, key_path, hostname, runner):
+    _check_pair(cert_path, key_path, runner, ("-checkhost", "-verify_hostname"), hostname,
+                require_dns_san=True)
+
+
+def _check_pair(cert_path, key_path, runner, flags, name, *, require_dns_san=False):
     def run(args):
         try:
             result = runner.run(args, timeout=10)
@@ -41,11 +126,16 @@ def validate_pair(cert_path, key_path, endpoint, runner):
         if result.returncode:
             raise HelperError("TLS_INVALID", "Certificate validation failed")
         return result.stdout
-    run(["/usr/bin/openssl", "x509", "-in", str(cert_path), "-noout", "-checkip", endpoint])
+    check, verify = flags
+    if require_dns_san:
+        alternatives = run(["/usr/bin/openssl", "x509", "-in", str(cert_path), "-noout", "-ext", "subjectAltName"])
+        if not re.search(rb"(?:^|[\s,])DNS:[^\s,]+", alternatives):
+            raise HelperError("TLS_INVALID", "A DNS subject alternative name is required")
+    run(["/usr/bin/openssl", "x509", "-in", str(cert_path), "-noout", check, name])
     run(["/usr/bin/openssl", "x509", "-in", str(cert_path), "-noout", "-checkend", "86400"])
     # X509_check_host/checkend do not check notBefore. verify checks both validity
     # bounds using this exact end certificate as the explicitly trusted anchor.
-    run(["/usr/bin/openssl", "verify", "-partial_chain", "-CAfile", str(cert_path), str(cert_path)])
+    run(["/usr/bin/openssl", "verify", "-partial_chain", verify, name, "-CAfile", str(cert_path), str(cert_path)])
     cert_public = run(["/usr/bin/openssl", "x509", "-in", str(cert_path), "-pubkey", "-noout"])
     key_public = run(["/usr/bin/openssl", "pkey", "-in", str(key_path), "-pubout"])
     if cert_public.strip() != key_public.strip():
@@ -57,7 +147,9 @@ def validate_pair(cert_path, key_path, endpoint, runner):
         raise HelperError("TLS_INVALID", "Certificate pair could not be loaded") from None
 
 
-def sync_certificate(*, layout=None, source_cert=SOURCE_CERT, source_key=SOURCE_KEY, runner=None, tls_gid=None, portal_tls_gid=None, validator=validate_pair):
+def sync_certificate(*, layout=None, source_cert=SOURCE_CERT, source_key=SOURCE_KEY, runner=None,
+                     tls_gid=None, portal_tls_gid=None, validator=validate_pair,
+                     managed_certbot_source=False, certbot_root=CERTBOT_ROOT):
     layout, runner = layout or Layout(), runner or Runner()
     policy = validate_policy(read_json(layout.policy, layout.trusted_uid))
     checked_path(layout.etc / "tls", layout.trusted_uid, directory=True)
@@ -65,14 +157,24 @@ def sync_certificate(*, layout=None, source_cert=SOURCE_CERT, source_key=SOURCE_
         checked_path(layout.etc / "web-tls", layout.trusted_uid, directory=True)
         if type(portal_tls_gid) is not int or portal_tls_gid <= 0:
             raise HelperError("TLS_INVALID", "The separate installed portal TLS group is required")
+    # Never generally enable symlink traversal. Only the explicit managed mode
+    # resolves the two live leaves to pinned, same-version archive regular files.
+    managed = None
+    if managed_certbot_source:
+        managed = _managed_pair_paths(source_cert, source_key, layout.trusted_uid, certbot_root)
+        cert_target, key_target = managed[0][0], managed[1][0]
+    else:
+        cert_target, key_target = source_cert, source_key
     # Read the two immutable snapshots first, then validate those exact bytes.
-    certificate = _read_regular(source_cert, layout.trusted_uid)
-    private_key = _read_regular(source_key, layout.trusted_uid)
+    certificate = _read_regular(cert_target, layout.trusted_uid)
+    private_key = _read_regular(key_target, layout.trusted_uid)
     with tempfile.TemporaryDirectory(prefix=".validate-", dir=layout.etc / "tls") as temporary:
         cert_stage, key_stage = Path(temporary) / "cert.pem", Path(temporary) / "key.pem"
         cert_stage.write_bytes(certificate); cert_stage.chmod(0o600)
         key_stage.write_bytes(private_key); key_stage.chmod(0o600)
         validator(cert_stage, key_stage, policy["server_endpoint"], runner)
+    if managed is not None and managed != _managed_pair_paths(source_cert, source_key, layout.trusted_uid, certbot_root):
+        raise HelperError("TLS_INVALID", "Managed source changed during validation; existing pair retained")
     fingerprints = {"certificate_sha256": hashlib.sha256(certificate).hexdigest()}
     unchanged = False
     if layout.tls_certificate.exists() and layout.tls_key.exists():
@@ -97,14 +199,73 @@ def sync_certificate(*, layout=None, source_cert=SOURCE_CERT, source_key=SOURCE_
             "services_restarted": False, "certificate_sha256": fingerprints["certificate_sha256"]}
 
 
+def sync_hostname_certificate(*, hostname, source_cert, source_key, layout=None, runner=None, portal_tls_gid=None,
+                              validator=validate_hostname_pair, certbot_root=CERTBOT_ROOT):
+    """Copy a portal hostname's own managed Certbot pair beside, never over, the IP pair.
+
+    Proxies and clients connecting by IP keep the IP pair; only the portal reads this one,
+    and only when a client asks for the hostname by SNI.
+    """
+    layout, runner = layout or Layout(), runner or Runner()
+    if not isinstance(hostname, str) or not HOSTNAME.fullmatch(hostname):
+        raise HelperError("TLS_INVALID", "A lowercase public DNS hostname is required")
+    policy = validate_policy(read_json(layout.policy, layout.trusted_uid))
+    if policy["version"] != 2 or type(portal_tls_gid) is not int or portal_tls_gid <= 0:
+        raise HelperError("TLS_INVALID", "The installed v2 portal and its TLS group are required")
+    web_tls = layout.etc / "web-tls"
+    checked_path(web_tls, layout.trusted_uid, directory=True)
+    managed = _managed_pair_paths(source_cert, source_key, layout.trusted_uid, certbot_root)
+    certificate = _read_regular(managed[0][0], layout.trusted_uid)
+    private_key = _read_regular(managed[1][0], layout.trusted_uid)
+    with tempfile.TemporaryDirectory(prefix=".validate-", dir=web_tls) as temporary:
+        cert_stage, key_stage = Path(temporary) / "cert.pem", Path(temporary) / "key.pem"
+        cert_stage.write_bytes(certificate); cert_stage.chmod(0o600)
+        key_stage.write_bytes(private_key); key_stage.chmod(0o600)
+        validator(cert_stage, key_stage, hostname, runner)
+    if managed != _managed_pair_paths(source_cert, source_key, layout.trusted_uid, certbot_root):
+        raise HelperError("TLS_INVALID", "Managed source changed during validation; existing pair retained")
+    target_cert, target_key = web_tls / "host-cert.pem", web_tls / "host-key.pem"
+    # Inspect both destinations before replacing either one. A changed certificate
+    # must not short-circuit validation of an unsafe existing key or status path.
+    existing = []
+    for target in (target_cert, target_key):
+        present = checked_path(target, layout.trusted_uid, missing=True)
+        existing.append(_read_regular(target, layout.trusted_uid) if present is not None else None)
+    checked_path(web_tls / "host-status.json", layout.trusted_uid, missing=True)
+    changed = existing != [certificate, private_key]
+    status = {"hostname": hostname, "certificate_sha256": hashlib.sha256(certificate).hexdigest()}
+    if changed:
+        atomic_bytes(target_cert, certificate, mode=0o640, trusted_uid=layout.trusted_uid, gid=portal_tls_gid)
+        atomic_bytes(target_key, private_key, mode=0o640, trusted_uid=layout.trusted_uid, gid=portal_tls_gid)
+        atomic_json(web_tls / "host-status.json", status, layout.trusted_uid)
+    return {"ok": True, "changed": changed, "legacy_modified": False, "services_restarted": False, **status}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Project-only validated TLS pair synchronization")
-    parser.parse_args(argv)
+    parser.add_argument("--source-cert", type=Path, help="Explicit certificate file; paired with --source-key")
+    parser.add_argument("--source-key", type=Path, help="Explicit private key file; paired with --source-cert")
+    parser.add_argument("--managed-certbot-source", action="store_true",
+                        help="Allow only matched /etc/letsencrypt/live/<name> managed archive symlinks")
+    parser.add_argument("--hostname", help="Copy this DNS name's own managed pair for the portal only")
+    args = parser.parse_args(argv)
+    if (args.source_cert is None) != (args.source_key is None):
+        parser.error("--source-cert and --source-key must be supplied together")
+    if args.managed_certbot_source and args.source_cert is None:
+        parser.error("managed Certbot mode requires both explicit source paths")
+    if args.hostname and not args.managed_certbot_source:
+        parser.error("--hostname requires --managed-certbot-source and both explicit source paths")
     try:
         if os.geteuid() != 0: raise HelperError("FORBIDDEN", "TLS sync requires the installed root service")
         policy = validate_policy(read_json(Layout().policy))
         portal_gid = grp.getgrnam("dazzle-web").gr_gid if policy["version"] == 2 else None
-        result = sync_certificate(tls_gid=grp.getgrnam("dazzle-vps").gr_gid, portal_tls_gid=portal_gid)
+        if args.hostname:
+            result = sync_hostname_certificate(hostname=args.hostname, source_cert=args.source_cert,
+                                               source_key=args.source_key, portal_tls_gid=portal_gid)
+        else:
+            result = sync_certificate(source_cert=args.source_cert or SOURCE_CERT, source_key=args.source_key or SOURCE_KEY,
+                                      managed_certbot_source=args.managed_certbot_source,
+                                      tls_gid=grp.getgrnam("dazzle-vps").gr_gid, portal_tls_gid=portal_gid)
         print(json.dumps(result, separators=(",", ":")))
         return 0
     except Exception:

@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .store import Store, parse_time, timestamp
 
 MAX_INT = 2**63 - 1
-REASONS = ("manual_disabled", "quota_exceeded", "metering_failure", "pool_protection", "revoked")
+CLOCK_STEP_SECONDS = 5  # Same bound as the five-second metering window.
+REASONS = ("manual_disabled", "quota_exceeded", "metering_failure", "pool_protection", "expired", "revoked")
 
 
 class DomainError(Exception):
@@ -60,13 +61,15 @@ def disabled_reasons(user: dict, now: dt.datetime | None = None) -> list[str]:
         reasons.add("manual_disabled")
     if user.get("revoked_at"):
         reasons.add("revoked")
-    if user.get("role") == "admin":
+    if user.get("role") == "admin" and user.get("unlimited"):
         reasons -= {"quota_exceeded", "metering_failure", "pool_protection"}
     elif not user.get("unlimited"):
         allowance = (user.get("quota_bytes") or 0) + user.get("topup_bytes", 0)
         if user.get("used_upload", 0) + user.get("used_download", 0) >= allowance:
             reasons.add("quota_exceeded")
-    if now is not None and user.get("role") != "admin" and not user.get("manual_disabled"):
+    if user.get("authorization_ended_at") or (now and user.get("authorization_expires_at") and parse_time(user["authorization_expires_at"]) <= now):
+        reasons.add("expired")
+    if now is not None and (user.get("role") != "admin" or not user.get("unlimited")) and not user.get("manual_disabled"):
         last = user.get("last_sample_at")
         if not user.get("trusted_sample") or last is None or (now - parse_time(last)).total_seconds() > 5:
             reasons.add("metering_failure")
@@ -75,6 +78,20 @@ def disabled_reasons(user: dict, now: dt.datetime | None = None) -> list[str]:
 
 def eligible(user: dict, now: dt.datetime | None = None) -> bool:
     return not disabled_reasons(user, now)
+
+
+def managed_origin_pending(worker: dict, user: dict, now: dt.datetime) -> bool:
+    """A root-acknowledged process has one bounded first-sample deadline.
+
+    This says nothing about permission to proxy; callers retain manual, quota,
+    history and revocation restrictions. No status read may renew the deadline.
+    """
+    return bool(worker["origin_pending"] and worker["verified_at"] and worker["process_id"] and
+                worker["provisioned"] and not worker["tombstoned"] and not worker["last_error"] and
+                worker["observed_state"] in {"staged", "running"} and
+                worker["credential_version"] == user["credential_version"] and
+                worker["observed_generation"] == worker["root_ack_generation"] == worker["generation"] and
+                0 <= (now - parse_time(worker["verified_at"])).total_seconds() <= 5)
 
 
 def _set_reasons(store: Store, user_id: str, reasons: set[str], now: dt.datetime) -> None:
@@ -121,10 +138,11 @@ def _sync_runtime(store: Store, now: dt.datetime, user_id: str | None = None) ->
     rows = store.conn.execute("SELECT * FROM users" + (" WHERE id=?" if user_id else ""),
                               (user_id,) if user_id else ()).fetchall()
     for row in rows:
-        user = dict(row)
+        user = store.get_user(row["id"])
         provider = store.get_meta("provider", {})
         reserve, safety = store.get_setting("admin_reserve_bytes"), store.get_setting("safety_margin_bytes")
-        if (user["role"] != "admin" and provider.get("unit_verified") and
+        from .budget import configured as budget_configured
+        if (not budget_configured(store) and user["role"] != "admin" and provider.get("unit_verified") and
                 type(provider.get("remaining_bytes")) is int and (reserve is not None or safety is not None)):
             inherited = set(json.loads(user["reasons_json"]))
             if provider["remaining_bytes"] <= (reserve or 0) + (safety or 0):
@@ -133,6 +151,18 @@ def _sync_runtime(store: Store, now: dt.datetime, user_id: str | None = None) ->
                 inherited.discard("pool_protection")
             user["reasons_json"] = json.dumps(sorted(inherited))
         reasons = disabled_reasons(user, now)
+        if store.get_meta("mode") == "production":
+            worker = store.worker(user["id"])
+            never_started = (worker["observed_state"] in {"unprovisioned", "provisioned"} and
+                             worker["process_id"] in (None, 0) and not worker["last_error"] and
+                             not user["meter_epoch"] and not user["last_sample_at"] and
+                             not store.conn.execute("SELECT 1 FROM metering_incidents WHERE user_id=? AND resolved_at IS NULL LIMIT 1", (user["id"],)).fetchone())
+            if never_started or ("metering_failure" not in json.loads(user["reasons_json"]) and
+                                  managed_origin_pending(worker, user, now)):
+                # Missing counters before a possible public listener, or while
+                # root's first-sample window is still open, are not an incident.
+                # All other authorization restrictions remain in force.
+                reasons = [reason for reason in reasons if reason != "metering_failure"]
         _set_reasons(store, user["id"], set(reasons), now)
         state = store.conn.execute("SELECT status,runtime_version FROM runtime_state WHERE user_id=?",
                                    (user["id"],)).fetchone()
@@ -144,6 +174,8 @@ def _sync_runtime(store: Store, now: dt.datetime, user_id: str | None = None) ->
 
 
 def _public_user(store: Store, user: dict, now: dt.datetime) -> dict:
+    user = store.get_user(user["id"])
+    from .trials import get as get_trial
     reasons = disabled_reasons(user, now)
     runtime = store.conn.execute("SELECT status FROM runtime_state WHERE user_id=?", (user["id"],)).fetchone()
     if user["revoked_at"]:
@@ -159,6 +191,8 @@ def _public_user(store: Store, user: dict, now: dt.datetime) -> dict:
         "status": status, "disabled_reasons": reasons, "unlimited": bool(user["unlimited"]),
         "auto_restore": bool(user["auto_restore"]), "email_verified": bool(user["email_verified"]),
         "deleted_at": user.get("deleted_at"),
+        "quota_pool": user.get("quota_pool"),
+        "trial": get_trial(store, user["id"]),
     }
 
 
@@ -214,8 +248,12 @@ def _mail_event(store: Store, user: dict, kind: str, now: dt.datetime, *, cycle_
         from .mail import enqueue_notification
     except ImportError:
         return
+    from .mail_templates import render
+    template = render(kind, name=user["name"], used_bytes=user["used_upload"] + user["used_download"],
+                      allowance_bytes=(user["quota_bytes"] or 0) + user["topup_bytes"],
+                      threshold_percent=user["threshold_percent"])
     enqueue_notification(store, event_key=f"{cycle_id}:{user['id']}:{kind}", user_id=user["id"],
-                         kind=kind, subject=f"Dazzle'VPS {kind}", body=detail, now=now, cycle_id=cycle_id)
+                         kind=kind, subject=template.subject, body=template.body + ("\n\n本地模拟验证：未执行线上停用操作。" if store.get_meta('mode') != 'production' else ''), now=now, cycle_id=cycle_id)
 
 
 def _notify_health(store: Store, now: dt.datetime) -> None:
@@ -227,8 +265,10 @@ def _notify_health(store: Store, now: dt.datetime) -> None:
         return
     cycle = ensure_cycle(store, now)
     def admin(kind: str, key: str, body: str, *, scope: str | None = None) -> None:
+        from .mail_templates import render
+        template = render(kind, detail=body)
         enqueue_notification(store, event_key=key, user_id=None, kind=kind,
-                             subject="Dazzle'VPS " + kind, body=body, now=now,
+                             subject=template.subject, body=template.body, now=now,
                              cycle_id=scope or cycle["id"])
     protected = []
     for row in store.conn.execute("SELECT * FROM users WHERE revoked_at IS NULL"):
@@ -241,7 +281,7 @@ def _notify_health(store: Store, now: dt.datetime) -> None:
                 "SELECT id FROM metering_incidents WHERE user_id=? AND resolved_at IS NULL "
                 "ORDER BY detected_at DESC,rowid DESC LIMIT 1", (user["id"],)).fetchone()
             episode = incident["id"] if incident is not None else user["meter_epoch"] or "unavailable"
-            detail = ("管理员计量异常已记录；管理员访问继续保留。" if user["role"] == "admin" else
+            detail = ("管理员计量异常已记录；管理员访问继续保留。" if user["role"] == "admin" and user["unlimited"] else
                       "计量异常已记录，已请求暂停该普通用户；请核对实例实际状态确认停用。" if production else
                       "计量异常已记录，已请求暂停该普通用户。本地模拟尚未部署，不能视为线上停用完成。")
             admin("metering_failure", f"{cycle['id']}:{user['id']}:metering_failure:{episode}", detail)
@@ -297,7 +337,7 @@ def _notify_health(store: Store, now: dt.datetime) -> None:
 def _quota(store: Store, user_id: str, now: dt.datetime) -> None:
     user = store.get_user(user_id)
     reasons = set(json.loads(user["reasons_json"]))
-    if user["role"] == "admin" or user["unlimited"]:
+    if user["unlimited"]:
         reasons.discard("quota_exceeded")
     else:
         allowance = user["quota_bytes"] + user["topup_bytes"]
@@ -318,7 +358,7 @@ def _quota(store: Store, user_id: str, now: dt.datetime) -> None:
 
 
 def _guard(store: Store, now: dt.datetime) -> None:
-    for row in store.conn.execute("SELECT * FROM users WHERE revoked_at IS NULL AND role='member' AND manual_disabled=0"):
+    for row in store.conn.execute("SELECT * FROM users WHERE revoked_at IS NULL AND (role='member' OR unlimited=0) AND manual_disabled=0"):
         user = dict(row)
         if store.get_meta("mode") == "production":
             worker = store.worker(user["id"])
@@ -328,8 +368,7 @@ def _guard(store: Store, now: dt.datetime) -> None:
             if (worker["observed_state"] in {"unprovisioned", "provisioned"} and worker["process_id"] in (None, 0) and
                     not user["meter_epoch"] and not user["last_sample_at"]):
                 continue
-            if (worker["origin_pending"] and worker["verified_at"] and
-                    0 <= (now - parse_time(worker["verified_at"])).total_seconds() <= 5):
+            if managed_origin_pending(worker, user, now):
                 continue
         last = user["last_sample_at"]
         if not user["trusted_sample"] or last is None or (now - parse_time(last)).total_seconds() > 5:
@@ -368,17 +407,20 @@ def _cycle_tick(store: Store, now: dt.datetime) -> dict:
         except ImportError:
             enqueue_notification = None
         if enqueue_notification is not None:
+            from .mail_templates import render
+            template = render('cycle_summary')
             enqueue_notification(store, event_key="quota-cycle-closed:" + cycle["id"], user_id=None,
-                                 kind="cycle_summary", subject="Dazzle'VPS quota cycle summary",
-                                 body=f"Recorded upload: {report['used_upload']} bytes; download: {report['used_download']} bytes. "
-                                      "This is the administrator schedule, not a confirmed provider reset.",
+                                 kind="cycle_summary", subject=template.subject, body=template.body,
                                  now=now, cycle_id=cycle["id"])
         for user in users:
+            from .trials import get as get_trial
+            if get_trial(store, user["id"]):
+                continue  # Trial quota is lifetime, including across cycle boundaries.
             reasons = set(json.loads(user["reasons_json"]))
             had_quota = "quota_exceeded" in reasons
             reasons.discard("quota_exceeded")
             manual = user["manual_disabled"] or (had_quota and not user["auto_restore"])
-            if user["role"] != "admin" and user["meter_epoch"] is not None and not covered(user):
+            if (user["role"] != "admin" or not user["unlimited"]) and user["meter_epoch"] is not None and not covered(user):
                 _incident(store, user, "cycle_boundary_unknown", now, context=cycle["id"])
                 reasons.add("metering_failure")
                 store.conn.execute("UPDATE users SET trusted_sample=0,meter_state='reconciliation_required' WHERE id=?", (user["id"],))
@@ -397,9 +439,11 @@ def _cycle_tick(store: Store, now: dt.datetime) -> dict:
             start, end = boundary, following
         cycle = _create_cycle(store, start, end)
         for user in users:
-            if user["role"] == "member" and not user["revoked_at"]:
+            if user["role"] == "member" and not user["revoked_at"] and not get_trial(store, user["id"]):
                 _mail_event(store, user, "cycle_started", now, cycle_id=cycle["id"],
                             detail="A new administrator-scheduled quota cycle began. Manual, metering and provider-protection restrictions remain in force.")
+    from .budget import refresh_admin
+    refresh_admin(store, now)
     _guard(store, now)
     _sync_runtime(store, now)
     return {"transitioned": transitioned, "cycle_id": cycle["id"]}
@@ -436,6 +480,7 @@ def snapshot(store: Store, now: dt.datetime | None = None) -> dict:
         warnings.append("Provider observation is missing or older than one hour; protection is insufficiently verified.")
     if settings["admin_reserve_bytes"] is None or settings["safety_margin_bytes"] is None:
         warnings.append("Administrator reserve and safety margin are not configured.")
+    from .budget import snapshot as budget_snapshot
     return {"schema_version": 1, "mode": store.get_meta("mode"), "revision": store.revision,
             "settings": settings, "quota_cycle": current, "provider": provider,
             "provider_freshness": freshness, "users": users, "deleted_users": deleted_users,
@@ -446,7 +491,7 @@ def snapshot(store: Store, now: dt.datetime | None = None) -> dict:
                        "overallocated": bool(overallocated),
                        "protection_state": "unverified" if not provider.get("unit_verified") else "stale" if freshness["state"] != "fresh" else (
                            "active" if any("pool_protection" in user["disabled_reasons"] for user in users) else "ready")},
-            "mail": mail,
+            "mail": mail, "budget": budget_snapshot(store, now),
             "operations": [dict(row) for row in store.conn.execute("SELECT * FROM operations ORDER BY rowid DESC LIMIT 100")],
             "cycles": cycles,
             "metering_incidents": [dict(row) for row in store.conn.execute(
@@ -471,6 +516,9 @@ def _add_user(store: Store, params: dict, now: dt.datetime) -> dict:
     if role == "admin" and store.conn.execute("SELECT 1 FROM users WHERE role='admin' AND revoked_at IS NULL").fetchone():
         raise DomainError("VALIDATION", "Only one live administrator identity is permitted")
     quota = None if role == "admin" else integer(params.get("quota_bytes", store.get_setting("default_quota_bytes")), "quota_bytes", 1)
+    from . import budget
+    if role == "member":
+        budget.validate_allowance(store, quota)
     occupied = {row[0] for row in store.conn.execute("SELECT port FROM users")}
     port = next((value for value in range(24430, 65536) if value not in occupied), None)
     if port is None:
@@ -483,7 +531,16 @@ def _add_user(store: Store, params: dict, now: dt.datetime) -> dict:
     return store.get_user(user_id)
 
 
-def _sample(store: Store, params: dict, now: dt.datetime, *, allow_revoked: bool = False) -> dict:
+def _sample(store: Store, params: dict, now: dt.datetime, *, allow_revoked: bool = False,
+            wall_clock: bool = False) -> dict:
+    """``wall_clock`` marks live frames stamped on receipt by this host's clock.
+
+    That clock can step back (NTP, VM migration or resume). Within
+    CLOCK_STEP_SECONDS the ledger follows the stepped clock at once, so its
+    five-second age is measured on the new clock from the next frame on; a
+    larger step is a metering incident for this user alone, never a writer
+    failure. Explicitly supplied samples keep strict ordering validation.
+    """
     user = _user(store, params, live=not allow_revoked)
     epoch = text(params.get("epoch"), "epoch", 200)
     upload = integer(params.get("uplink"), "uplink")
@@ -493,11 +550,18 @@ def _sample(store: Store, params: dict, now: dt.datetime, *, allow_revoked: bool
     except (ValueError, TypeError):
         raise DomainError("VALIDATION", "Sample at must be a timezone-aware ISO timestamp") from None
     if at > now + dt.timedelta(seconds=5):
-        raise DomainError("VALIDATION", "Sample timestamp is too far in the future")
+        if not wall_clock:
+            raise DomainError("VALIDATION", "Sample timestamp is too far in the future")
+        # Received before the clock stepped back further than five seconds.
+        # Counters are cumulative, so the next frame still carries these bytes.
+        return {"duplicate": False, "ignored": True, "reason": "clock_stepped_back",
+                "trusted": bool(user["trusted_sample"])}
     cycle = ensure_cycle(store, now)
     previous_at = parse_time(user["last_sample_at"]) if user["last_sample_at"] else None
-    if previous_at and at < previous_at:
+    stepped_back = previous_at is not None and at < previous_at
+    if stepped_back and not wall_clock:
         raise DomainError("VALIDATION", "Out-of-order samples are not accepted")
+    clock_regression = stepped_back and (previous_at - at).total_seconds() > CLOCK_STEP_SECONDS
     if previous_at == at and epoch == user["meter_epoch"] and upload == user["last_uplink"] and download == user["last_downlink"]:
         return {"duplicate": True, "trusted": bool(user["trusted_sample"])}
     initial = user["meter_epoch"] is None
@@ -506,11 +570,12 @@ def _sample(store: Store, params: dict, now: dt.datetime, *, allow_revoked: bool
     stale = (now - at).total_seconds() > 5 or (previous_at is not None and (at - previous_at).total_seconds() > 5)
     crossing = previous_at is not None and previous_at < parse_time(cycle["start_at"]) <= at
     safe_initial = initial and upload == 0 and download == 0 and not stale
-    trusted = safe_initial or not (initial or changed or regression or stale or crossing)
+    trusted = safe_initial or not (initial or changed or regression or stale or crossing or clock_regression)
     reasons = set(json.loads(user["reasons_json"]))
     if not trusted:
         kind = ("initial_nonzero_baseline" if initial else "worker_epoch_changed" if changed else
-                "counter_regression" if regression else "cycle_boundary_gap" if crossing else
+                "counter_regression" if regression else "clock_stepped_back" if clock_regression else
+                "cycle_boundary_gap" if crossing else
                 "sample_gap" if previous_at is not None and (at - previous_at).total_seconds() > 5 else "stale_sample")
         known_delta = None
         if (not initial and not changed and not regression and previous_at is not None and
@@ -576,9 +641,10 @@ def _provider_observe(store: Store, params: dict, now: dt.datetime) -> dict:
             cycle = ensure_cycle(store, now)
             warning = not provider.get("unit_verified") or result.get("event_kind") != "reset_confirmed"
             kind = "provider_warning" if warning else "provider_cycle_confirmed"
+            from .mail_templates import render
+            template=render('provider_warning' if warning else 'provider_reset_confirmed')
             enqueue_notification(store, event_key=f"{kind}:{provider.get('observed_at')}", user_id=None,
-                                 kind=kind, subject="Dazzle'VPS provider observation",
-                                 body="Provider evidence was recorded separately. Administrator-scheduled user quotas were not reset.",
+                                 kind=kind, subject=template.subject, body=template.body,
                                  now=now, cycle_id=cycle["id"])
     return result
 
@@ -641,18 +707,56 @@ def handle_action(store: Store, action: str, params: dict, now: dt.datetime) -> 
         elif action == "user.topup":
             if user["role"] == "admin" or user["unlimited"]:
                 raise DomainError("VALIDATION", "Unlimited accounts do not need a top-up")
+            from .budget import ADMIN_POOL
+            if user.get("quota_pool") == ADMIN_POOL:
+                raise DomainError("VALIDATION", "该用户共用管理员剩余额度，不能单独加量")
             amount = integer(params.get("bytes"), "bytes", 1)
             if amount + user["topup_bytes"] + user["quota_bytes"] > MAX_INT:
                 raise DomainError("VALIDATION", "Allowance exceeds supported range")
+            from . import budget, trials
+            budget.validate_allowance(store, amount + user["topup_bytes"] + user["quota_bytes"], user=user,
+                                      trial=trials.get(store, user_id) is not None)
             store.conn.execute("UPDATE users SET topup_bytes=topup_bytes+?,updated_at=? WHERE id=?", (amount, timestamp(now), user_id))
         else:
             changes = {}
             if "name" in params:
                 changes["name"] = text(params["name"], "name")
+            from . import budget as budget_rules
+            pooled = user.get("quota_pool") == budget_rules.ADMIN_POOL
+            if "quota_pool" in params:
+                target = params["quota_pool"]
+                if target not in {None, budget_rules.ADMIN_POOL}:
+                    raise DomainError("VALIDATION", "quota_pool must be administrator or null")
+                if target == budget_rules.ADMIN_POOL and not pooled:
+                    from .trials import get as get_trial
+                    if user["role"] != "member" or user["unlimited"]:
+                        raise DomainError("VALIDATION", "只有有限额度的普通用户可以改为共用管理员剩余额度")
+                    if not budget_rules.configured(store):
+                        raise DomainError("BUDGET_NOT_CONFIGURED", "请先确认套餐预算；管理员剩余额度只在预算保护下存在")
+                    if get_trial(store, user_id):
+                        raise DomainError("VALIDATION", "体验用户不能共用管理员剩余额度")
+                    if user["topup_bytes"] or "quota_bytes" in params:
+                        raise DomainError("VALIDATION", "共用管理员剩余额度的用户没有单独的基础额度或加量")
+                    released = max(0, (user["quota_bytes"] or 0) - user["used_upload"] - user["used_download"])
+                    if budget_rules.snapshot(store, now)["admin_remaining_bytes"] + released < budget_rules.GB:
+                        raise DomainError("BUDGET_EXCEEDED", "管理员剩余额度不足1GB，改为共用后会立即暂停")
+                    changes["quota_pool"] = budget_rules.ADMIN_POOL
+                elif target is None and pooled:
+                    if "quota_bytes" not in params:
+                        raise DomainError("VALIDATION", "退出管理员额度池时须同时设定固定基础额度")
+                    changes["quota_pool"] = None
+                    pooled = False
+                elif target is None:
+                    raise DomainError("VALIDATION", "该用户未使用管理员剩余额度")
             if "quota_bytes" in params:
-                if user["role"] == "admin":
-                    raise DomainError("VALIDATION", "Administrator allowance is unlimited")
+                if user["role"] == "admin" or pooled:
+                    raise DomainError("VALIDATION", "管理员额度由剩余预算自动计算，不能手动覆盖")
                 changes["quota_bytes"] = integer(params["quota_bytes"], "quota_bytes", 1)
+                from . import budget, trials
+                if budget.configured(store) and not trials.get(store, user_id):
+                    integer(changes['quota_bytes'], 'quota_bytes', 50 * budget.GB)
+                    if changes['quota_bytes'] % budget.GB:
+                        raise DomainError('VALIDATION', '基础额度须为整数GB')
             for key in ("auto_restore", "unlimited"):
                 if key in params:
                     value = boolean(params[key], key)
@@ -674,11 +778,28 @@ def handle_action(store: Store, action: str, params: dict, now: dt.datetime) -> 
                 raise DomainError("VALIDATION", "No supported user fields were supplied")
             if changes.get("quota_bytes", user["quota_bytes"]) is not None and changes.get("quota_bytes", user["quota_bytes"]) + user["topup_bytes"] > MAX_INT:
                 raise DomainError("VALIDATION", "Combined allowance exceeds the supported range")
+            from . import budget, trials
+            if changes.get("unlimited") and budget.configured(store):
+                raise DomainError("VALIDATION", "预算保护启用后不允许不限量授权")
+            if changes.get("unlimited") and not user["unlimited"] and store.get_meta("mode") == "production":
+                raise DomainError("BUDGET_NOT_CONFIGURED", "请先确认套餐预算；普通用户不能改为不限量授权")
+            if "quota_bytes" in changes or (changes.get("unlimited") == 0 and user["unlimited"]):
+                budget.validate_allowance(store, changes.get("quota_bytes", user["quota_bytes"]) + user["topup_bytes"], user=user,
+                                          trial=trials.get(store, user_id) is not None)
             changes["updated_at"] = timestamp(now)
             store.conn.execute("UPDATE users SET " + ",".join(key + "=?" for key in changes) + " WHERE id=?",
                                (*changes.values(), user_id))
         if action not in {"user.revoke", "user.delete"}:
             _quota(store, user_id, now)
+        else:
+            from .mail import enqueue_notification
+            from .mail_templates import render
+            kind='user_deleted' if action=='user.delete' else 'user_revoked'
+            template=render(kind,name=user['name'])
+            enqueue_notification(store,event_key=kind+':'+user_id,user_id=None,kind=kind,
+                                 subject=template.subject,body=template.body,now=now,cooldown_seconds=0)
+        from .budget import refresh_admin
+        refresh_admin(store, now)
         _sync_runtime(store, now, user_id)
     elif action == "settings.update":
         permitted = {"default_quota_bytes", "admin_reserve_bytes", "safety_margin_bytes", "day", "time", "timezone"}
@@ -692,12 +813,19 @@ def handle_action(store: Store, action: str, params: dict, now: dt.datetime) -> 
                 if not isinstance(value, str) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
                     raise DomainError("VALIDATION", "Time must use HH:MM")
             elif key == "timezone":
+                # Store exactly the key that was validated; every later cycle
+                # boundary loads it again.
+                value = text(value, "timezone", 100)
                 try:
-                    ZoneInfo(text(value, "timezone", 100))
-                except ZoneInfoNotFoundError:
+                    ZoneInfo(value)
+                except (ZoneInfoNotFoundError, ValueError):
                     raise DomainError("VALIDATION", "Unknown timezone") from None
             elif value is not None or key == "default_quota_bytes":
                 value = integer(value, key, 1 if key == "default_quota_bytes" else 0)
+                if key == 'default_quota_bytes':
+                    from .budget import configured, GB
+                    if configured(store) and (value < 50*GB or value % GB):
+                        raise DomainError('VALIDATION', '默认正式用户额度须为至少50GB的整数GB')
             store.set_setting(key, value)
         _sync_runtime(store, now)
         result["schedule_effective"] = "next_boundary"

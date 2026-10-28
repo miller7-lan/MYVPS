@@ -186,6 +186,7 @@ class ProgramUpdateTests(unittest.TestCase):
         # Reconstruct only the old additive schema; no live database is used.
         database = folder / "state.sqlite3"
         with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP INDEX IF EXISTS one_live_user_per_port")
             connection.execute("ALTER TABLE users DROP COLUMN deleted_at")
             connection.execute("DROP TABLE IF EXISTS mail_secrets")
             connection.execute("DROP TABLE IF EXISTS mail_private_payload")
