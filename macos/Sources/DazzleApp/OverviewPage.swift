@@ -61,10 +61,18 @@ struct DashboardPage: View {
         Card {
             HStack { Text("服务商余额").font(.caption).foregroundStyle(.secondary); Spacer(); Text("QQG.NET").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary) }
             if data.providerVerified {
-                Text(Display.bytes(data.providerRemaining)).font(.system(size: 23, weight: .semibold, design: .rounded))
+                Text(store.value("provider")["source"].string == "qqg_api"
+                     ? store.value("provider")["remaining_display"].text : Display.bytes(data.providerRemaining))
+                    .font(.system(size: 23, weight: .semibold, design: .rounded))
                 ProgressView(value: Double(data.providerRemaining ?? 0) / Double(data.providerTotal ?? 1)).tint(VPSTheme.accent)
                     .accessibilityLabel("服务商剩余 " + Display.bytes(data.providerRemaining) + "，总量 " + Display.bytes(data.providerTotal))
-                Text("已核实 · 与代理载荷分开统计").font(.system(size: 10)).foregroundStyle(.secondary)
+                Text(store.value("provider")["source"].string == "qqg_api"
+                     ? "QQG 标注 GB 按 GiB 计算 · 独立整机计量" : "已核实 · 与代理载荷分开统计")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                if store.value("provider")["source"].string == "qqg_api" {
+                    Text("上次同步 " + Display.date(store.value("provider_sync")["last_success_at"]))
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
             } else {
                 HStack { Text("未同步").font(.system(size: 23, weight: .semibold)); Spacer(); Image(systemName: "cloud.slash").font(.system(size: 21, weight: .light)).foregroundStyle(.tertiary) }
                 Button("查看历史记录与接入状态", action: onSettings).font(.system(size: 11)).buttonStyle(.plain).foregroundStyle(VPSTheme.accent)
@@ -85,10 +93,14 @@ struct DashboardPage: View {
                     Button { onUser(user.id) } label: {
                         HStack(spacing: 12) {
                             IconTile(symbol: user.role == "admin" ? "crown" : "person")
-                            VStack(alignment: .leading, spacing: 4) { Text(user.name).font(.system(size: 13, weight: .medium)).lineLimit(1); Text(user.role == "admin" ? "管理员 · 不限个人额度" : "剩余 " + (user.remaining.map(Display.bytes) ?? "不限额")).font(.system(size: 10)).foregroundStyle(.secondary) }.frame(width: 185, alignment: .leading)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(user.name).font(.system(size: 13, weight: .medium)).lineLimit(1)
+                                Text(user.sharesAdministratorBudget ? (store.budget.configured ? "管理员额度池 · 剩余 " + Display.bytes(store.budget.raw["admin_remaining_bytes"].int) : "预算保护尚未启用") : (user.isTrial ? "体验剩余 " : "本期剩余 ") + (user.remaining.map(Display.bytes) ?? "不限额"))
+                                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                            }.frame(width: 185, alignment: .leading)
                             VStack(alignment: .trailing, spacing: 7) {
                                 Text(Display.bytes(user.used)).font(.system(size: 12, weight: .medium, design: .rounded))
-                                if user.allowance != nil { UsageTrack(used: user.used, limit: user.allowance) }
+                                if !user.sharesAdministratorBudget && user.allowance != nil { UsageTrack(used: user.used, limit: user.allowance) }
                                 else { Text("不设个人额度").font(.system(size: 9)).foregroundStyle(.tertiary) }
                             }.frame(maxWidth: .infinity)
                             StatusBadge(user: user).frame(width: 75)

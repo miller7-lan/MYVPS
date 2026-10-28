@@ -4,14 +4,13 @@ import DazzleModels
 struct CyclesPage: View {
     @Bindable var store: AppStore
     @State private var editing = false
+    @State private var configuringBudget = false
     @State private var recording = false
     @State private var confirmingReset = false
     @State private var day = 24
     @State private var time = "16:19"
     @State private var timezone = "Asia/Shanghai"
     @State private var defaultQuota = "100"
-    @State private var reserve = ""
-    @State private var safety = ""
     @State private var remaining = ""
     @State private var total = ""
     @State private var expectedReset = ""
@@ -37,7 +36,7 @@ struct CyclesPage: View {
                 }
                 ProgressView(value: cycleProgress(cycle)).tint(VPSTheme.accent)
                 HStack { Text(shortDate(cycle["start_at"])); Spacer(); Text("下次刷新 " + shortDate(cycle["end_at"])) }.font(.caption).foregroundStyle(VPSTheme.muted)
-                Text("普通用户 \(Display.bytes(settings["default_quota_bytes"].int)) / 周期 · 管理员不限额").font(.callout)
+                Text("普通用户 \(Display.bytes(settings["default_quota_bytes"].int)) / 周期").font(.callout)
                 if editing {
                     Divider()
                     HStack {
@@ -47,8 +46,7 @@ struct CyclesPage: View {
                     }
                     HStack(spacing: 18) {
                         LabeledContent("默认 GB") { TextField("100", text: $defaultQuota).frame(width: 80) }
-                        LabeledContent("预留 GB") { TextField("未配置", text: $reserve).frame(width: 80) }
-                        LabeledContent("安全余量 GB") { TextField("未配置", text: $safety).frame(width: 80) }
+                        Text("整数，至少50GB").font(.caption).foregroundStyle(VPSTheme.muted)
                     }
                     HStack {
                         Text("修改按下个周期生效，不会立即刷新。").font(.caption).foregroundStyle(VPSTheme.muted)
@@ -56,16 +54,23 @@ struct CyclesPage: View {
                     }
                 }
             }
+            budgetCard
             Card {
                 HStack {
                     Text("QQG.NET").font(.headline)
-                    Text(provider["source"].string == "historical_manual_snapshot" ? "历史快照 · 未验证" : "人工记录 · 未自动同步").font(.caption).foregroundStyle(.orange)
+                    Text(providerSourceLabel(provider)).font(.caption)
+                        .foregroundStyle(automaticProvider(provider) && store.value("provider_sync")["state"].string == "ok" && store.value("provider_freshness")["state"].string == "fresh" ? VPSTheme.accent : .orange)
                     Spacer(); Button(recording ? "收起" : "人工核对") { recording.toggle() }.disabled(!store.canPerform("provider.observe"))
                 }
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(provider["remaining_display"].text).font(.system(size: 28, weight: .semibold, design: .rounded))
-                        Text("页面剩余 · 总额 \(provider["total_display"].text)").font(.caption).foregroundStyle(VPSTheme.muted)
+                        Text((automaticProvider(provider) ? "QQG 最近读数 · 已用 \(provider["used_display"].text) · 总额 " : "页面剩余 · 总额 ") + provider["total_display"].text)
+                            .font(.caption).foregroundStyle(VPSTheme.muted)
+                        if automaticProvider(provider) {
+                            Text("QQG 的 GB 为 GiB（1024³ 字节），与本地载荷的十进制 GB 分开统计。")
+                                .font(.caption).foregroundStyle(VPSTheme.muted)
+                        }
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 6) {
@@ -82,6 +87,12 @@ struct CyclesPage: View {
                         ValueRow(name: "核实总量", value: Display.bytes(provider["total_bytes"].int))
                         ValueRow(name: "实际重置", value: Display.date(provider["last_actual_reset_at"]))
                         ValueRow(name: "商家时区", value: provider["timezone"].text)
+                        if store.value("provider_sync")["configured"].bool == true {
+                            let sync = store.value("provider_sync")
+                            ValueRow(name: "上次同步", value: Display.date(sync["last_success_at"]))
+                            ValueRow(name: "同步状态", value: providerSyncText(sync))
+                            ValueRow(name: "QQG 计数 ÷ 本地载荷", value: sync["calibration"]["ratio"].double.map { String(format: "%.2f", $0) } ?? "数据不足")
+                        }
                         if let note = provider["evidence"].string, !note.isEmpty { Text(note).font(.caption).foregroundStyle(VPSTheme.muted).frame(maxWidth: .infinity, alignment: .leading) }
                         Link("打开 QQG.NET", destination: URL(string: "https://www.qqg.net/")!).font(.caption).frame(maxWidth: .infinity, alignment: .leading)
                     }.padding(.top, 10)
@@ -100,9 +111,36 @@ struct CyclesPage: View {
                 }
             }
         }.onAppear { load() }
+            .sheet(isPresented: $configuringBudget) { BudgetConfigurationSheet(store: store) }
             .confirmationDialog("确认商家已实际重置？", isPresented: $confirmingReset) {
                 Button("记录已核实重置") { observe() }; Button("取消", role: .cancel) {}
             } message: { Text("仅保存商家证据，不刷新个人额度。") }
+    }
+    private var budgetCard: some View {
+        Card {
+            HStack {
+                Text("分配预算").font(.headline)
+                Spacer()
+                Text(store.budget.configured ? (store.budget.providerRemainingVerified ? "本地预算 · QQG 核验" : "人工确认 · 本地账本") : "尚未配置").font(.caption).foregroundStyle(store.budget.configured ? VPSTheme.accent : .orange)
+                Button(store.budget.configured ? "重新确认" : "确认预算") { configuringBudget = true }.disabled(!store.canPerform("budget.configure"))
+            }
+            if store.budget.configured {
+                HStack(spacing: 20) {
+                    VStack(alignment: .leading, spacing: 5) { Text("可分配").font(.caption).foregroundStyle(VPSTheme.muted); Text(Display.bytes(store.budget.available)).font(.title2.weight(.semibold)).monospacedDigit() }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Text("共享预留 " + Display.bytes(store.budget.raw["members_reserved_bytes"].int))
+                        Text("安全余量 " + Display.bytes(store.budget.raw["safety_margin_bytes"].int))
+                    }.font(.caption).foregroundStyle(VPSTheme.muted)
+                }
+                ValueRow(name: "套餐预算", value: Display.bytes(store.budget.raw["total_bytes"].int))
+                ValueRow(name: "管理员可用余额", value: Display.bytes(store.budget.raw["admin_remaining_bytes"].int))
+            }
+            Text(store.budget.administratorPolicy).font(.callout)
+            Text(store.budget.reason).font(.caption).foregroundStyle(VPSTheme.muted)
+            Label(store.budget.providerRemainingVerified ? "QQG 余量已核实；管理员设定的额度刷新规则继续独立运行。" : "商家余量未核验；管理员设定的额度刷新规则继续独立运行。", systemImage: "info.circle")
+                .font(.caption2).foregroundStyle(VPSTheme.muted)
+        }
     }
     private var observationForm: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -133,18 +171,11 @@ struct CyclesPage: View {
         let s = store.value("settings")
         day = Int(s["day"].int ?? 24); time = s["time"].string ?? "16:19"; timezone = s["timezone"].string ?? "Asia/Shanghai"
         defaultQuota = String(format: "%g", Double(s["default_quota_bytes"].int ?? 100_000_000_000) / 1e9)
-        reserve = s["admin_reserve_bytes"].int.map { String(format: "%g", Double($0) / 1e9) } ?? ""
-        safety = s["safety_margin_bytes"].int.map { String(format: "%g", Double($0) / 1e9) } ?? ""
     }
     private func saveSettings() {
-        guard let quota = decimalGB(defaultQuota), TimeZone(identifier: timezone) != nil,
+        guard let quota = QuotaInput.bytes(defaultQuota, minimumGB: 50), TimeZone(identifier: timezone) != nil,
               time.range(of: #"\A(?:[01][0-9]|2[0-3]):[0-5][0-9]\z"#, options: .regularExpression) != nil else { store.error = "请核对额度、时区和时间。"; return }
-        var p: [String: JSONValue] = ["day": .integer(Int64(day)), "time": .string(time), "timezone": .string(timezone), "default_quota_bytes": .integer(quota)]
-        for (key, value) in [("admin_reserve_bytes", reserve), ("safety_margin_bytes", safety)] {
-            if value.isEmpty { p[key] = .null }
-            else if let bytes = decimalGB(value) { p[key] = .integer(bytes) }
-            else { store.error = "预留和安全余量请输入有效 GB 数值。"; return }
-        }
+        let p: [String: JSONValue] = ["day": .integer(Int64(day)), "time": .string(time), "timezone": .string(timezone), "default_quota_bytes": .integer(quota)]
         Task { await store.perform("settings.update", p) }
     }
     private func observe() {
@@ -165,6 +196,29 @@ struct CyclesPage: View {
     }
     private func shortDate(_ value: JSONValue) -> String {
         let full = Display.date(value); return full.count >= 10 ? String(full.prefix(10)) : full
+    }
+    private func automaticProvider(_ provider: JSONValue) -> Bool { provider["source"].string == "qqg_api" }
+    private func providerSourceLabel(_ provider: JSONValue) -> String {
+        let sync = store.value("provider_sync")
+        if sync["configured"].bool == true {
+            if sync["enabled"].bool != true { return "QQG 自动同步 · 已暂停" }
+            if sync["state"].string == "error" { return "QQG 自动同步 · 中断" }
+            if sync["state"].string == "waiting" { return "QQG 自动同步 · 等待首次读取" }
+            if automaticProvider(provider) {
+                return store.value("provider_freshness")["state"].string == "fresh"
+                    ? "QQG 自动同步 · 已核实" : "QQG 自动同步 · 读数已过期"
+            }
+        }
+        return provider["source"].string == "historical_manual_snapshot" ? "历史快照 · 未验证" : "人工记录 · 未自动同步"
+    }
+    private func providerSyncText(_ sync: JSONValue) -> String {
+        switch sync["state"].string {
+        case "ok": return "正常 · 每 \((sync["interval_seconds"].int ?? 600) / 60) 分钟"
+        case "error": return "中断 · " + (sync["last_error"]["message"].string ?? "原因未知")
+        case "disabled": return "已暂停"
+        case "waiting": return "等待首次读取"
+        default: return "未配置"
+        }
     }
     private func cycleProgress(_ cycle: JSONValue) -> Double {
         func date(_ value: JSONValue) -> Date? {
@@ -220,20 +274,36 @@ struct RecoveryPage: View {
 
 struct ConnectionPage: View {
     @Bindable var store: AppStore
+    private var providerConnectionStatus: String {
+        let sync = store.value("provider_sync")
+        guard sync["configured"].bool == true else { return "QQG 自动同步未配置" }
+        guard sync["enabled"].bool == true else { return "QQG 自动同步已暂停" }
+        switch sync["state"].string {
+        case "ok": return store.value("provider_freshness")["state"].string == "fresh" ? "QQG 自动同步正常" : "QQG 读数已过期"
+        case "error": return "QQG 自动同步中断"
+        default: return "QQG 等待首次读取"
+        }
+    }
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             Card {
                 HStack { Text("服务器连接").font(.headline); Spacer(); Label("受限管理", systemImage: "lock").font(.caption).foregroundStyle(VPSTheme.accent) }
-                TextField("服务器地址", text: $store.sshHost).disabled(store.busy)
-                HStack {
-                    TextField("已有 SSH 私钥文件", text: $store.sshKeyPath)
-                    Button { store.chooseSSHKey() } label: { Image(systemName: "folder") }.help("选择已有私钥")
-                }.disabled(store.busy)
+                if store.fixedConnection != nil {
+                    ValueRow(name: "固定服务器", value: store.sshHost)
+                    ValueRow(name: "SSH 私钥文件", value: store.sshKeyPath)
+                    Text("已固定连接配置，启动时自动连接。").font(.caption).foregroundStyle(VPSTheme.accent)
+                } else {
+                    TextField("服务器地址", text: $store.sshHost).disabled(store.connecting)
+                    HStack {
+                        TextField("已有 SSH 私钥文件", text: $store.sshKeyPath)
+                        Button { store.chooseSSHKey() } label: { Image(systemName: "folder") }.help("选择已有私钥")
+                    }.disabled(store.connecting)
+                }
                 HStack {
                     Text("复用已有 SSH，密钥只引用不复制。").font(.caption).foregroundStyle(VPSTheme.muted)
                     Spacer()
                     Button("连接服务器") { Task { await store.connectManagement() } }
-                        .buttonStyle(.borderedProminent).disabled(store.busy || store.sshHost.isEmpty || store.sshKeyPath.isEmpty)
+                        .buttonStyle(.borderedProminent).disabled(store.connecting || store.sshHost.isEmpty || store.sshKeyPath.isEmpty)
                 }
                 if let context = store.serverContext { ValueRow(name: "已固定的服务器身份", value: context.serverID) }
                 DisclosureGroup("连接要求与范围") {
@@ -249,7 +319,7 @@ struct ConnectionPage: View {
             Card("数据与服务边界") {
                 ValueRow(name: "服务器管理", value: store.serverContext == nil ? "未连接" : "按服务器能力管理新程序")
                 ValueRow(name: "旧 443 / 8443", value: "并行保留，不参与新程序额度和撤销")
-                ValueRow(name: "邮件 / 商家 API", value: (store.value("mail")["configured"].bool == true ? "邮件已配置" : "邮件待配置") + " / API 等待文档核验")
+                ValueRow(name: "邮件 / 商家 API", value: (store.value("mail")["configured"].bool == true ? "邮件已配置" : "邮件待配置") + " / " + providerConnectionStatus)
                 DisclosureGroup("隐私与存储") {
                     Text("真实快照仅保存在当前进程内；私密导出权限 0600，不进入操作日志。应用没有本地 HTTP 管理端口，连接后前台每约 8 秒只刷新快照。")
                         .font(.caption).foregroundStyle(VPSTheme.muted).padding(.top, 8)

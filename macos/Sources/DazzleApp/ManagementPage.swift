@@ -24,7 +24,7 @@ struct ManagementStatusCard: View {
             if store.serverNeedsReview {
                 HStack {
                     Label("上次修改结果待核对，没有自动重试", systemImage: "exclamationmark.circle").font(.caption).foregroundStyle(.orange)
-                    Spacer(); Button("核对状态") { Task { await store.refresh() } }.disabled(store.busy)
+                    Spacer(); Button("核对状态") { Task { await store.refresh() } }.disabled(store.connecting)
                 }
             } else if let problem = store.serverRefreshError {
                 Label(problem, systemImage: "wifi.exclamationmark").font(.caption).foregroundStyle(.orange)
@@ -37,7 +37,7 @@ struct ManagementStatusCard: View {
                 VStack(spacing: 8) {
                     ValueRow(name: "服务器身份", value: store.serverContext?.serverID ?? "未连接")
                     ValueRow(name: "可用能力", value: "仅根策略登记的新用户与实例")
-                    ValueRow(name: "状态刷新", value: "前台约 8 秒，不轮询商家 API")
+                    ValueRow(name: "状态刷新", value: "前台约 8 秒（恢复连接时约 2 秒），后台刷新不锁定操作")
                     ValueRow(name: "旧服务 / SSH / 防火墙", value: "没有修改入口")
                 }.padding(.top, 8)
             }.font(.caption).foregroundStyle(VPSTheme.muted)

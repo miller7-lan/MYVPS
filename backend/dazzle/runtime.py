@@ -49,5 +49,5 @@ def deployment_preview() -> dict:
                          "Restore last known-good project runtime after reapplying permanent revocation tombstones",
                          "Never roll back ledger counters, mail idempotency or completed cycles",
                          "Never overwrite current valid TLS certificate with an older backup"],
-            "blockers": ["No official QQG API scope/schema verified", "No real SMTP configured",
+            "blockers": ["QQG API key is account-wide; restrict it to the server IP whitelist", "No real SMTP configured",
                          "Native API is not enabled or verified on production", "New ports not approved"]}

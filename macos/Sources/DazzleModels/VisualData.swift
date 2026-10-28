@@ -19,7 +19,7 @@ public struct TrafficOverview: Sendable {
         users = snapshot.users.filter { !$0.revoked }
         upload = Self.sum(snapshot.users.map { $0.raw["used_upload"].int ?? 0 })
         download = Self.sum(snapshot.users.map { $0.raw["used_download"].int ?? 0 })
-        allocated = Self.sum(users.filter { $0.role != "admin" }.compactMap(\.allowance))
+        allocated = Self.sum(users.filter { !$0.sharesAdministratorBudget }.compactMap(\.allowance))
         availableUsers = users.filter { $0.reasons.isEmpty && ["ready", "running", "active", "enabled"].contains($0.raw["status"].string ?? "") }.count
         let p = snapshot["provider"]
         if p["unit_verified"].bool == true, snapshot["provider_freshness"]["state"].string == "fresh",

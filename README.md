@@ -50,3 +50,7 @@ GitHub 合并与服务器发布分别记录。完整文件对照见[分支整合
 - [Clash Verge Rev 官方项目](https://github.com/clash-verge-rev/clash-verge-rev)
 
 上游协议来源和许可见 [third_party/NOTICE.md](third_party/NOTICE.md)。
+
+## QQG 自动同步
+
+QQG 整机余额自动同步与 App 显示已接入；每个用户仍使用独立本地代理载荷计量。单位、预算约束、发布与验证见 [上线记录](docs/QQG自动同步上线记录-2026-10-28.md)。凭据请保存在仓库外，由 `scripts/qqg_provider_configure.py` 引用；先不加 `--apply` 预览，再按需提交。

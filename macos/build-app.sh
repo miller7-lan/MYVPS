@@ -21,16 +21,27 @@ cp "$MACOS_DIR/.build/release/DazzleVPS" "$STAGED_APP/Contents/MacOS/DazzleVPS"
 bash "$MACOS_DIR/make-icon.sh" "$STAGED_APP/Contents/Resources/AppIcon.icns" >/dev/null
 python3 - "$REPO_DIR" "$STAGED_APP" <<'PY'
 from pathlib import Path
-import plistlib,shutil,sys
+import json,os,plistlib,shutil,sys
 repo,app=map(Path,sys.argv[1:])
 licenses=app/'Contents'/'Resources'/'third_party'
 if licenses.exists():shutil.rmtree(licenses)
 shutil.copytree(repo/'third_party',licenses,ignore=shutil.ignore_patterns('__pycache__','*.pyc','.DS_Store'))
-info={'CFBundleName':"Dazzle'VPS",'CFBundleDisplayName':"Dazzle'VPS",'CFBundleIdentifier':'com.dazzle.vps.manager',
+info={'CFBundleName':'DazzleVPS','CFBundleDisplayName':'DazzleVPS','CFBundleIdentifier':'com.dazzle.vps.manager',
       'CFBundleExecutable':'DazzleVPS','CFBundleIconFile':'AppIcon.icns','CFBundlePackageType':'APPL','CFBundleShortVersionString':'3.1',
       'CFBundleVersion':'31','LSMinimumSystemVersion':'14.0','NSHighResolutionCapable':True,
       'DazzleRPCSchemaVersion':1,
       'NSHumanReadableCopyright':'Dazzle VPS · Local administrator application'}
+profile_path = os.environ.get('DAZZLE_FIXED_CONNECTION_FILE')
+if profile_path:
+    profile = json.loads(Path(profile_path).read_text())
+    if not isinstance(profile,dict) or set(profile) != {'Host','IdentityFile'}:
+        raise SystemExit('Fixed connection requires only Host and IdentityFile.')
+    if not all(isinstance(value,str) and value.strip() for value in profile.values()):
+        raise SystemExit('Fixed connection values must be nonempty strings.')
+    profile = {key:value.strip() for key,value in profile.items()}
+    if not Path(profile['IdentityFile']).is_absolute() or not Path(profile['IdentityFile']).is_file():
+        raise SystemExit('Fixed connection requires an existing absolute SSH key path.')
+    info['DazzleFixedConnection'] = profile
 with (app/'Contents'/'Info.plist').open('wb') as handle:plistlib.dump(info,handle)
 PY
 # Sign outside Documents: File Provider can reattach FinderInfo during signing.

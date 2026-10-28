@@ -29,6 +29,8 @@ struct UsersPage: View {
     @State private var search = ""
     @State private var showsDeleted = false
     @State private var addSheet = false
+    @State private var trialSheet = false
+    @State private var editingTrial: ProxyUser?
     @State private var editing: ProxyUser?
     @State private var showsExport = false
     @State private var showsTopup = false
@@ -55,9 +57,15 @@ struct UsersPage: View {
                     Text("已删除 \(store.deletedUsers.count)").tag(true)
                 }.pickerStyle(.segmented).frame(width: 245)
                 Spacer()
+                if store.serverContext?.allows("trial.create") == true {
+                    Button { trialSheet = true } label: { Label("临时体验", systemImage: "hourglass") }
+                        .disabled(!store.canPerform("trial.create") || !store.budget.canAllocate)
+                        .help(store.budget.canAllocate ? "默认3天、累计5GB，直接导出配置" : store.budget.reason)
+                }
                 Button { addSheet = true } label: { Label("添加用户", systemImage: "plus") }
-                    .buttonStyle(.borderedProminent).disabled(!store.canPerform("user.add"))
+                    .buttonStyle(.borderedProminent).disabled(!store.canPerform("user.add") || !store.budget.canAllocate)
             }
+            if !store.budget.canAllocate { NoticeBox(icon: "lock.shield", text: store.budget.reason, tint: .orange) }
             if listedUsers.isEmpty {
                 Card { EmptyState(icon: showsDeleted ? "archivebox" : "person.2", title: showsDeleted ? "没有已删除用户" : "添加第一位用户", detail: showsDeleted ? "删除会撤销授权并保留审计记录。" : "每位用户一份凭据，可在多台设备使用。") }
             } else {
@@ -69,6 +77,8 @@ struct UsersPage: View {
             }
         }
         .sheet(isPresented: $addSheet) { UserEditor(store: store, existing: nil) }
+        .sheet(isPresented: $trialSheet) { TrialEditor(store: store, existing: nil) }
+        .sheet(item: $editingTrial) { TrialEditor(store: store, existing: $0) }
         .sheet(item: $editing) { UserEditor(store: store, existing: $0) }
         .onAppear { if let initialSelection { search = ""; selected = initialSelection } }
         .onChange(of: initialSelection) { _, value in if let value { search = ""; selected = value } }
@@ -82,15 +92,17 @@ struct UsersPage: View {
             } else if let added = new.first(where: { !previous.contains($0) }) { search = ""; selected = added }
         }
         .confirmationDialog(confirmationTitle, isPresented: Binding(get: { confirmAction != nil }, set: { if !$0 { confirmAction = nil } })) {
-            Button(confirmAction == "user.delete" ? "删除并归档" : confirmAction == "user.revoke" ? "永久撤销" : "确认轮换", role: .destructive) {
-                if let action = confirmAction, let target = confirmUser, (action == "user.delete" || !target.revoked), store.canPerform(action) {
-                    Task { await store.perform(action, ["user_id": .string(target.id)], expectedRevision: confirmationRevision) }
+            Button(confirmAction == "user.cleanup.confirm" ? "确认记录并释放名额" : confirmAction == "user.delete" ? "删除并归档" : confirmAction == "user.revoke" ? "永久撤销" : "确认轮换", role: .destructive) {
+                if let action = confirmAction, let target = confirmUser, (action == "user.delete" || action == "user.cleanup.confirm" || !target.revoked), store.canPerform(action) {
+                    var parameters: [String: JSONValue] = ["user_id": .string(target.id)]
+                    if action == "user.cleanup.confirm" { parameters["confirm_unknown_gap"] = .bool(true) }
+                    Task { await store.perform(action, parameters, expectedRevision: confirmationRevision) }
                 }
                 confirmAction = nil
             }
             Button("取消", role: .cancel) { confirmAction = nil }
         } message: {
-            Text(confirmAction == "user.delete" ? "撤销凭据并从当前列表移除；流量账本和审计记录继续保留，可在已删除列表查看。实例停止以服务确认为准。当前试运行资源不会自动回收，重新添加用户需重新授权服务器资源，不能直接复用此名额。" : confirmAction == "user.revoke" ? "保留用量记录；恢复旧配置也不会重新授权。" : "旧凭据将失效，所有使用此用户的客户端都需要重新导入。")
+            Text(confirmAction == "user.cleanup.confirm" ? "此用户已停止，但停止前的尾部用量无法精确重建。确认表示接受并记录该不确定性，保留已知用量与审计后释放名额；不会清零流量、恢复旧凭据或自动放行其他人。需要系统身份确认。" : confirmAction == "user.delete" ? "立即使订阅链接与凭据失效，并请求停止此用户实例。停止可能仍待确认，请在已删除列表查看清理结果。流量账本和审计记录保留，归档不可恢复授权；名额释放以停止和计量核对结果为准。" : confirmAction == "user.revoke" ? "保留用量记录；恢复旧配置也不会重新授权。" : "旧凭据将失效，所有使用此用户的客户端都需要重新导入。")
         }
     }
 
@@ -114,7 +126,7 @@ struct UsersPage: View {
                                     .frame(width: 32, height: 34)
                                 VStack(alignment: .leading, spacing: 5) {
                                     Text(item.name).font(.system(size: 12, weight: .semibold)).lineLimit(1)
-                                    Text(item.role == "admin" ? "管理员 · 不限额" : "剩余 " + Display.bytes(item.remaining))
+                                    Text(item.sharesAdministratorBudget ? (store.budget.configured ? "管理员额度池 · 共享余额" : "预算保护尚未启用") : item.isTrial ? "体验 · 剩余 " + Display.bytes(item.remaining) : "剩余 " + Display.bytes(item.remaining))
                                         .font(.system(size: 10)).foregroundStyle(VPSTheme.muted).lineLimit(1)
                                 }
                                 Spacer(minLength: 4)
@@ -136,50 +148,78 @@ struct UsersPage: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(user.name).font(.system(size: 23, weight: .semibold)).foregroundStyle(VPSTheme.ink)
-                    Text(user.role == "admin" ? "管理员" : "普通用户").font(.caption).foregroundStyle(VPSTheme.muted)
+                    Text(user.role == "admin" ? "管理员" : user.sharesAdministratorBudget ? "管理员额度池 · 普通用户权限" : user.isTrial ? "临时体验" : "普通用户").font(.caption).foregroundStyle(VPSTheme.muted)
                 }
                 Spacer(); StatusBadge(user: user)
             }
             VStack(alignment: .leading, spacing: 12) {
-                Text(user.role == "admin" ? "个人额度" : "本期剩余").font(.caption).foregroundStyle(VPSTheme.muted)
-                Text(user.role == "admin" ? "不限额" : Display.bytes(user.remaining))
+                Text(user.sharesAdministratorBudget ? "额度池共享剩余" : user.isTrial ? "体验剩余" : "本期剩余").font(.caption).foregroundStyle(VPSTheme.muted)
+                Text(user.sharesAdministratorBudget ? (store.budget.configured ? Display.bytes(store.budget.raw["admin_remaining_bytes"].int) : "预算保护尚未启用") : Display.bytes(user.remaining))
                     .font(.system(size: 32, weight: .semibold, design: .rounded)).monospacedDigit()
-                if let limit = user.allowance { UsageTrack(used: user.used, limit: limit) }
+                if !user.sharesAdministratorBudget, let limit = user.allowance { UsageTrack(used: user.used, limit: limit) }
                 HStack {
                     Text("已用 " + Display.bytes(user.used))
                     Spacer()
-                    Text(user.role == "admin" ? "商家实际剩余未验证" : "共 " + Display.bytes(user.allowance))
+                    Text(user.sharesAdministratorBudget ? "商家实际剩余未验证" : "共 " + Display.bytes(user.allowance))
                 }.font(.caption).foregroundStyle(VPSTheme.muted)
+                if user.sharesAdministratorBudget { Text(store.budget.administratorPolicy).font(.caption2).foregroundStyle(VPSTheme.muted) }
+                if user.isTrial {
+                    ValueRow(name: "到期时间", value: Display.date(user.trial.raw["expires_at"]))
+                    Text("按累计用量计费，不随月度周期重置").font(.caption2).foregroundStyle(VPSTheme.muted)
+                }
             }.padding(.vertical, 5)
             HStack(spacing: 10) {
                 Button { showsExport = true } label: { Label("导出配置", systemImage: "square.and.arrow.up") }
-                    .buttonStyle(.borderedProminent).disabled(!store.canPerform("user.export") || user.revoked)
+                    .buttonStyle(.borderedProminent).disabled(!store.canPerform("user.export", target: user.id) || user.revoked)
                     .popover(isPresented: $showsExport, arrowEdge: .bottom) {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("导出格式").font(.caption).foregroundStyle(VPSTheme.muted)
                             exportButton("Shadowrocket", format: "shadowrocket", user: user)
                             exportButton("Mihomo / Clash", format: "mihomo", user: user)
                             exportButton("节点链接", format: "uris", user: user)
-                        }.padding(18).frame(width: 205).disabled(!store.canPerform("user.export") || user.revoked)
+                        }.padding(18).frame(width: 205).disabled(!store.canPerform("user.export", target: user.id) || user.revoked)
                     }
                     .help("系统身份确认后导出私密配置")
-                if user.role != "admin" {
+                if !user.sharesAdministratorBudget && !user.isTrial {
                     Button("加量") { topup = "10"; showsTopup = true }
-                        .disabled(!store.canPerform("user.topup") || user.revoked).popover(isPresented: $showsTopup, arrowEdge: .bottom) { topupPopover(user) }
+                        .disabled(!store.canPerform("user.topup", target: user.id) || user.revoked || !store.budget.canAllocate).popover(isPresented: $showsTopup, arrowEdge: .bottom) { topupPopover(user) }
                 }
-                Button("编辑") { editing = user }.disabled(!store.canPerform("user.update") || user.revoked)
+                Button("编辑") { editing = user }.disabled(!store.canPerform("user.update", target: user.id) || user.revoked)
+                if user.isTrial {
+                    Button("调整体验") { editingTrial = user }.disabled(!store.canPerform("trial.update", target: user.id) || user.revoked)
+                }
                 Spacer(minLength: 8)
                 Menu {
-                    Button("轮换凭据…") { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.rotate" }.disabled(!store.canPerform("user.rotate") || user.revoked)
+                    Button("轮换凭据…") { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.rotate" }.disabled(!store.canPerform("user.rotate", target: user.id) || user.revoked)
                     Divider()
-                    Button("永久撤销…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.revoke" }.disabled(!store.canPerform("user.revoke") || user.revoked)
-                    Divider()
-                    Button("删除用户…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.delete" }
-                        .disabled(!store.canPerform("user.delete") || isLastAdmin(user)).help(isLastAdmin(user) ? "最后一名管理员不能删除" : "撤销授权并归档，保留流量账本")
+                    Button("永久撤销…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.revoke" }.disabled(!store.canPerform("user.revoke", target: user.id) || user.revoked)
                 } label: { Image(systemName: "ellipsis").frame(width: 20, height: 20) }
                     .menuStyle(.borderlessButton).fixedSize().disabled(!store.canModify).help("更多操作")
             }
             Divider()
+            if store.serverContext?.allows("user.recovery.preview") == true {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(user.connectionRecoveryLabel).font(.callout.weight(.medium))
+                        Text("由你主动确认重建连接，保留已用流量、额度和原订阅").font(.caption2).foregroundStyle(VPSTheme.muted)
+                        if store.recoveryNoticeUserID == user.id {
+                            RecoverySteps(progress: RecoveryProgress(recovery: user.recovery, lastStep: store.recoveryLastStep))
+                        }
+                    }
+                    Spacer()
+                    if user.needsConnectionRecovery || store.forcedRecoveryAvailable {
+                        Button {
+                            var params: [String: JSONValue] = ["user_id": .string(user.id)]
+                            if store.forcedRecoveryAvailable { params["force_restart"] = .bool(true) }
+                            Task { await store.perform("user.recovery.preview", params) }
+                        } label: { Label(store.forcedRecoveryAvailable ? "强制恢复连接" : "恢复正常使用", systemImage: "arrow.triangle.2.circlepath") }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!store.canPerform("user.recovery.preview", target: user.id) || user.revoked)
+                            .help("由你主动确认，仅重建此用户连接；需系统身份验证，保留原用量和订阅")
+                    }
+                }
+                Divider()
+            }
             if !protections.isEmpty {
                 Label("保护暂停：" + protections.map(Display.reason).joined(separator: "、"), systemImage: "pause.circle")
                     .font(.caption).foregroundStyle(.orange)
@@ -215,7 +255,21 @@ struct UsersPage: View {
                     }
                 }
                 Spacer()
+                if store.serverContext?.allows("user.subscription_email") == true {
+                    Button { Task { await store.perform("user.subscription_email", ["user_id": .string(user.id)]) } } label: {
+                        Label("重发订阅邮件", systemImage: "envelope.arrow.triangle.branch")
+                    }
+                    .disabled(!store.canPerform("user.subscription_email", target: user.id) || !user.canReceiveSubscriptionEmail)
+                    .help(user.canReceiveSubscriptionEmail ? "系统身份确认后，将原订阅发送至此用户已验证邮箱" : "用户需已启用、连接正常且绑定邮箱已验证")
+                }
                 Text("凭据 v\(user.raw["credential_version"].int ?? 1)").font(.caption2).foregroundStyle(VPSTheme.muted)
+            }
+            HStack {
+                Text("删除使链接失效，并保留用量审计").font(.caption2).foregroundStyle(VPSTheme.muted)
+                Spacer()
+                Button("删除用户…", role: .destructive) { confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.delete" }
+                    .disabled(!store.canPerform("user.delete", target: user.id) || isLastAdmin(user))
+                    .help(isLastAdmin(user) ? "最后一名管理员不能删除" : "停止实例并归档，清理结果以服务确认为准")
             }
         }
     }
@@ -225,10 +279,16 @@ struct UsersPage: View {
     }
     private func archivedDetail(_ user: ProxyUser) -> some View {
         Card {
-            HStack { Text(user.name).font(.title2.weight(.semibold)); Spacer(); Label("已删除", systemImage: "archivebox").font(.caption).foregroundStyle(VPSTheme.muted) }
-            Text("授权删除已归档，用量与审计记录保留；实例停止以服务确认为准，归档不能恢复授权。").font(.caption).foregroundStyle(VPSTheme.muted)
+            HStack { Text(user.name).font(.title2.weight(.semibold)); Spacer(); Label(UserDeletionPolicy.cleanupConfirmed(user) ? "已清理" : UserDeletionPolicy.stopConfirmed(user) ? "已停止 · 待结算" : "停止待确认", systemImage: "archivebox").font(.caption).foregroundStyle(UserDeletionPolicy.cleanupConfirmed(user) ? VPSTheme.accent : .orange) }
+            Text("订阅链接与凭据已失效；用量与审计记录保留。归档不能恢复授权。").font(.caption).foregroundStyle(VPSTheme.muted)
             if !UserDeletionPolicy.stopConfirmed(user) {
                 NoticeBox(icon: "exclamationmark.triangle.fill", text: user.raw["runtime_state"].string == "stop_failed" ? "服务停止失败，旧连接可能仍在活动；请核对实例。" : "服务停止尚未确认；删除归档不代表已立即断开。", tint: .orange)
+            }
+            if UserDeletionPolicy.canConfirmUnknownTail(user) {
+                NoticeBox(icon: "exclamationmark.triangle", text: "尾部用量存在未知间隙，尚未释放名额。原用量仍保留，需要你确认并记录风险。", tint: .orange)
+                Button("确认记录并释放名额…") {
+                    confirmUser = user; confirmationRevision = store.snapshot?.revision; confirmAction = "user.cleanup.confirm"
+                }.disabled(!store.canPerform("user.cleanup.confirm", target: user.id))
             }
             ValueRow(name: "本周期上传", value: Display.bytes(user.raw["used_upload"].int))
             ValueRow(name: "本周期下载", value: Display.bytes(user.raw["used_download"].int))
@@ -243,25 +303,26 @@ struct UsersPage: View {
             Text(user.name).font(.caption).foregroundStyle(VPSTheme.muted).lineLimit(1)
             HStack { TextField("加量", text: $topup).textFieldStyle(.roundedBorder).accessibilityLabel("加量 GB"); Text("GB").foregroundStyle(VPSTheme.muted) }
             Text("仅当前周期生效").font(.caption2).foregroundStyle(VPSTheme.muted)
+            ValueRow(name: "可分配预算", value: Display.bytes(store.budget.available))
             HStack {
                 Spacer()
                 Button("确认加量") {
-                    guard let bytes = decimalGB(topup), bytes > 0, store.canPerform("user.topup"), !user.revoked else { return }
+                    guard let bytes = QuotaInput.bytes(topup), store.budget.permits(bytes), store.canPerform("user.topup", target: user.id), !user.revoked else { return }
                     showsTopup = false
                     Task { await store.perform("user.topup", ["user_id": .string(user.id), "bytes": .integer(bytes)]) }
                 }.buttonStyle(.borderedProminent)
-                    .disabled((decimalGB(topup) ?? 0) <= 0 || !store.canPerform("user.topup") || user.revoked)
+                    .disabled((QuotaInput.bytes(topup).map { !store.budget.permits($0) } ?? true) || !store.canPerform("user.topup", target: user.id) || user.revoked)
             }
         }.padding(20).frame(width: 255)
     }
 
     private var confirmationTitle: String {
         let name = confirmUser?.name ?? "此用户"
-        return confirmAction == "user.delete" ? "删除“\(name)”并归档？" : confirmAction == "user.revoke" ? "永久撤销“\(name)”？" : "轮换“\(name)”的凭据？"
+        return confirmAction == "user.cleanup.confirm" ? "确认“\(name)”的未知尾部用量？" : confirmAction == "user.delete" ? "删除“\(name)”并归档？" : confirmAction == "user.revoke" ? "永久撤销“\(name)”？" : "轮换“\(name)”的凭据？"
     }
     private func exportButton(_ name: String, format: String, user: ProxyUser) -> some View {
         Button(name) {
-            guard store.canPerform("user.export"), !user.revoked else { return }
+            guard store.canPerform("user.export", target: user.id), !user.revoked else { return }
             showsExport = false
             Task { await store.perform("user.export", ["user_id": .string(user.id), "format": .string(format)]) }
         }
@@ -285,8 +346,18 @@ struct UserEditor: View {
     @State private var threshold = 80
     @State private var advanced = false
     @State private var originalRevision: Int64?
+    @State private var originalQuota = ""
     private var editorAction: String { existing == nil ? "user.add" : "user.update" }
     private var isAdmin: Bool { (existing?.role ?? role) == "admin" }
+    private var sharesBudget: Bool { isAdmin || existing?.sharesAdministratorBudget == true }
+    private var quotaChanged: Bool { !sharesBudget && existing?.isTrial != true && (existing == nil || quota != originalQuota) }
+    private var allocationAllowed: Bool {
+        if existing == nil && !store.budget.canAllocate { return false }
+        guard quotaChanged else { return true }
+        guard let bytes = QuotaInput.bytes(quota, minimumGB: 50) else { return false }
+        let extra = max(0, bytes - (existing?.quota ?? 0))
+        return extra == 0 || store.budget.permits(extra)
+    }
     private var unchangedVerifiedEmail: Bool {
         existing?.raw["email_verified"].bool == true && email.trimmingCharacters(in: .whitespacesAndNewlines) == existing?.raw["email"].string
     }
@@ -300,11 +371,11 @@ struct UserEditor: View {
                         Picker("角色", selection: $role) { Text("普通用户").tag("member"); Text("管理员").tag("admin") }.labelsHidden()
                     }
                 }
-                if isAdmin { LabeledContent("个人额度", value: "不限额").foregroundStyle(VPSTheme.muted) }
+                if sharesBudget { LabeledContent("额度策略", value: "管理员额度池 · " + store.budget.administratorPolicy).foregroundStyle(VPSTheme.muted) }
                 else {
                     LabeledContent("基础额度") {
                         HStack { TextField("额度", text: $quota).textFieldStyle(.roundedBorder).accessibilityLabel("基础额度 GB"); Text("GB / 周期").font(.caption).foregroundStyle(VPSTheme.muted) }
-                    }.help("不含当前周期的临时加量")
+                    }.disabled(existing?.isTrial == true).help(existing?.isTrial == true ? "体验额度在“调整体验”修改" : "整数 GB，至少50GB；不含本期临时加量")
                 }
                 if existing != nil {
                     LabeledContent("通知邮箱") { TextField("选填", text: $email).textFieldStyle(.roundedBorder).accessibilityLabel("通知邮箱") }
@@ -315,7 +386,10 @@ struct UserEditor: View {
                     }
                 }
             }.font(.system(size: 13)).disabled(!store.canPerform(editorAction) || existing?.revoked == true)
-            if existing != nil && !isAdmin {
+            if quotaChanged && !allocationAllowed {
+                NoticeBox(icon: "lock.shield", text: QuotaInput.bytes(quota, minimumGB: 50) == nil ? "普通用户额度需为至少50GB的整数。" : store.budget.rejectionReason(for: max(0, (QuotaInput.bytes(quota, minimumGB: 50) ?? 0) - (existing?.quota ?? 0))), tint: .orange)
+            }
+            if existing != nil && !isAdmin && existing?.isTrial != true {
                 DisclosureGroup("进阶设置", isExpanded: $advanced) {
                     VStack(alignment: .leading, spacing: 13) {
                         Toggle("下周期自动恢复", isOn: $autoRestore)
@@ -328,21 +402,22 @@ struct UserEditor: View {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("保存") { save() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.canPerform(editorAction) || existing?.revoked == true)
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !store.canPerform(editorAction) || existing?.revoked == true || !allocationAllowed)
             }
         }.padding(26).frame(width: 455).onAppear {
             originalRevision = store.snapshot?.revision
             if let user = existing {
-                name = user.name; quota = String(Double(user.quota ?? 100_000_000_000) / 1e9)
+                name = user.name; quota = String(format: "%g", Double(user.quota ?? 100_000_000_000) / 1e9)
                 email = user.raw["email"].string ?? ""; autoRestore = user.raw["auto_restore"].bool ?? true
                 threshold = Int(user.raw["threshold_percent"].int ?? 80)
-            } else { quota = String(Double(store.value("settings")["default_quota_bytes"].int ?? 100_000_000_000) / 1e9) }
+            } else { quota = String(format: "%g", Double(store.value("settings")["default_quota_bytes"].int ?? 100_000_000_000) / 1e9) }
+            originalQuota = quota
         }
     }
     private func save() {
-        guard store.canPerform(editorAction), existing?.revoked != true else { return }
-        let bytes = decimalGB(quota)
-        if !isAdmin, bytes == nil || bytes == 0 { store.error = "请输入大于 0 的有效额度数值。"; return }
+        guard store.canPerform(editorAction), existing?.revoked != true, allocationAllowed else { return }
+        let bytes = quotaChanged ? QuotaInput.bytes(quota, minimumGB: 50) : nil
+        if quotaChanged, bytes == nil { store.error = "普通用户额度需为至少50GB的整数。"; return }
         var params: [String: JSONValue]
         if let user = existing {
             do { params = try UserPayload.update(user: user, name: name, quotaBytes: bytes, email: email, autoRestore: autoRestore, thresholdPercent: threshold) }

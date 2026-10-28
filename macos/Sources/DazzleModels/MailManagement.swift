@@ -57,6 +57,9 @@ public struct SMTPDraft: Sendable {
 
 public enum MailFeedback {
     public static func message(action: String, result: JSONValue) -> (text: String, warning: Bool) {
+        if action == "user.subscription_email", result["queued"].bool == true {
+            return ("订阅邮件已排队，等待 SMTP 提交；请稍后查收。原订阅和用量保留。", false)
+        }
         if action == "mail.configure" {
             return result["configured"].bool == true ? ("邮件设置已保存", false) : ("设置已保存，请补充邮箱授权码", true)
         }
@@ -73,9 +76,31 @@ public enum MailFeedback {
     }
 }
 
+extension ProxyUser {
+    public var canReceiveSubscriptionEmail: Bool {
+        if raw["subscription_email_available"].bool == false { return false }
+        return !revoked && reasons.isEmpty && raw["deleted_at"].string == nil &&
+            raw["email_verified"].bool == true && MailStatus.validEmail(raw["email"].string ?? "") &&
+            raw["runtime_state"].string == "running" && raw["runtime_verified_at"].string != nil &&
+            raw["meter_state"].string == "trusted"
+    }
+}
+
 public enum UserDeletionPolicy {
     public static func stopConfirmed(_ user: ProxyUser) -> Bool {
-        ["revoked", "stopped"].contains(user.raw["runtime_state"].string ?? "")
+        let worker = user.raw["worker"]
+        guard worker.object["process_id"] != nil, worker.object["last_error"] != nil,
+              ["revoked", "stopped"].contains(user.raw["runtime_state"].string ?? ""),
+              worker["process_id"] == .null || worker["process_id"].int == 0,
+              worker["last_error"] == .null || worker["last_error"].string == "",
+              worker["verified_at"].string != nil else { return false }
+        return true
+    }
+    public static func cleanupConfirmed(_ user: ProxyUser) -> Bool {
+        stopConfirmed(user) && (user.raw["trial"]["status"].string == "cleaned" || user.raw["cleanup"]["state"].string == "released")
+    }
+    public static func canConfirmUnknownTail(_ user: ProxyUser) -> Bool {
+        stopConfirmed(user) && user.revoked && user.raw["cleanup"]["state"].string == "waiting_reconciliation" && user.raw["cleanup"]["requires_unknown_gap_confirmation"].bool == true
     }
     public static func isProtectedAdministrator(_ user: ProxyUser, currentUsers: [ProxyUser]) -> Bool {
         user.role == "admin" && !currentUsers.contains { $0.id != user.id && $0.role == "admin" && !$0.revoked }

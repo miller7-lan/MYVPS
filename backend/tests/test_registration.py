@@ -767,6 +767,88 @@ class RegistrationTests(unittest.TestCase):
             finally:
                 self.store = original_store
 
+    def test_rejected_retention_boundary_runs_without_any_app_connected(self):
+        from dazzle.collector import tick
+        me, session = self.register(); account = me["account"]["id"]
+        self.rpc("registration.reject", {"account_id": account})
+        deadline = self.now + dt.timedelta(hours=72)
+        row = registration.snapshot(self.store, self.now)["accounts"][0]
+        self.assertEqual(row["rejected_delete_at"], timestamp(deadline))
+        tick(self.store, deadline - dt.timedelta(microseconds=1))
+        self.assertEqual(registration._account(self.store, account)["status"], "rejected")
+        revision = self.store.revision
+        rate_count = self.store.conn.execute("SELECT COUNT(*) FROM portal_rate").fetchone()[0]
+        tick(self.store, deadline)
+        self.assertEqual(self.store.revision, revision + 1)
+        self.assertFalse(registration.snapshot(self.store, deadline)["accounts"])
+        for table in ("portal_sessions", "portal_challenges", "portal_mail"):
+            self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM " + table + " WHERE account_id=?", (account,)).fetchone()[0], 0)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_private_payload").fetchone()[0], 0)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM portal_rate").fetchone()[0], rate_count)
+        self.assertEqual(registration.prune_rejected(self.store, deadline), 0)
+        self.now = deadline
+        self.assertEqual(self.public("session.me", {"session_token": session}, ok=False)["error"]["code"], "UNAUTHENTICATED")
+        self.assertEqual(self.rpc("registration.approve", {"account_id": account}, ok=False)["error"]["code"], "NOT_FOUND")
+        replacement, _ = self.register()
+        self.assertNotEqual(replacement["account"]["id"], account)
+
+    def test_retention_starts_at_rejection_and_repeated_rejection_does_not_extend_it(self):
+        me, _ = self.register(); account = me["account"]["id"]
+        created = self.now
+        self.now += dt.timedelta(days=10)
+        self.rpc("registration.reject", {"account_id": account})
+        rejected = self.now
+        self.now += dt.timedelta(hours=71)
+        self.rpc("registration.reject", {"account_id": account})
+        self.assertEqual(registration._account(self.store, account)["updated_at"], timestamp(rejected))
+        self.assertEqual(registration.prune_rejected(self.store, rejected - dt.timedelta(seconds=30)), 0)
+        self.assertEqual(registration.prune_rejected(self.store, self.now), 0)
+        self.assertEqual(registration.prune_rejected(self.store, rejected + dt.timedelta(hours=72)), 1)
+        self.assertLess(created, rejected)
+
+    def test_expired_rejection_does_not_touch_linked_users_or_other_application_states(self):
+        me, _ = self.register(); linked = me["account"]["id"]
+        self.rpc("registration.approve", {"account_id": linked})
+        users = [tuple(row) for row in self.store.conn.execute("SELECT * FROM users")]
+        credentials = [tuple(row) for row in self.store.conn.execute("SELECT * FROM credentials")]
+        workers = [tuple(row) for row in self.store.conn.execute("SELECT * FROM production_workers")]
+        # Even a damaged linked row is excluded from automatic application cleanup.
+        self.store.conn.execute("UPDATE portal_accounts SET status='rejected' WHERE id=?", (linked,))
+        for status in ("pending", "unverified", "waiting_resources", "approved", "revoked", "rejected"):
+            self.store.conn.execute("INSERT INTO portal_accounts(id,email,nickname,status,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                                    (status, status + "@example.test", status, status, timestamp(self.now), timestamp(self.now)))
+        self.assertEqual(registration.prune_rejected(self.store, self.now + dt.timedelta(hours=72)), 1)
+        self.assertIsNotNone(self.store.conn.execute("SELECT 1 FROM portal_accounts WHERE id=?", (linked,)).fetchone())
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM portal_accounts").fetchone()[0], 6)
+        for table, previous in [("users", users), ("credentials", credentials), ("production_workers", workers)]:
+            self.assertEqual([tuple(row) for row in self.store.conn.execute("SELECT * FROM " + table)], previous)
+
+    def test_rejected_cleanup_waits_for_inflight_mail_and_preserves_notification_history(self):
+        me, _ = self.register(); account = me["account"]["id"]
+        self.rpc("registration.reject", {"account_id": account})
+        message = self.store.conn.execute("SELECT outbox_id FROM portal_mail WHERE account_id=? LIMIT 1", (account,)).fetchone()[0]
+        self.store.conn.execute("UPDATE mail_outbox SET status='sending' WHERE id=?", (message,))
+        deadline = self.now + dt.timedelta(hours=72)
+        self.assertEqual(registration.prune_rejected(self.store, deadline), 0)
+        self.store.conn.execute("UPDATE mail_outbox SET status='sent' WHERE id=?", (message,))
+        pending = self.store.conn.execute("SELECT COUNT(*) FROM portal_mail m JOIN mail_outbox o ON m.outbox_id=o.id WHERE m.account_id=? AND o.status IN ('queued','retry')", (account,)).fetchone()[0]
+        self.assertEqual(registration.prune_rejected(self.store, deadline), 1)
+        self.assertEqual(self.store.conn.execute("SELECT status FROM mail_outbox WHERE id=?", (message,)).fetchone()[0], "sent")
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM mail_outbox WHERE status='cancelled' AND error_code='REGISTRATION_RETENTION_EXPIRED'").fetchone()[0], pending)
+
+    def test_rejected_cleanup_is_transactional_and_handles_legacy_timestamps(self):
+        from dazzle.collector import tick
+        me, _ = self.register(); account = me["account"]["id"]
+        self.rpc("registration.reject", {"account_id": account})
+        deadline = self.now + dt.timedelta(hours=72)
+        self.store.conn.execute("UPDATE portal_accounts SET updated_at=? WHERE id=?", (self.now.astimezone(dt.timezone(dt.timedelta(hours=8))).isoformat(), account))
+        with patch("dazzle.registration.queue_activation_notices", side_effect=RuntimeError("fixture maintenance failure")):
+            with self.assertRaises(RuntimeError): tick(self.store, deadline)
+        self.assertEqual(registration._account(self.store, account)["status"], "rejected")
+        self.assertGreater(self.store.conn.execute("SELECT COUNT(*) FROM portal_sessions WHERE account_id=?", (account,)).fetchone()[0], 0)
+        tick(self.store, deadline)
+        self.assertFalse(registration.snapshot(self.store, deadline)["accounts"])
+
     def test_rejection_has_no_runtime_or_quota_side_effects(self):
         me, _ = self.register(); account = me["account"]["id"]
         self.rpc("registration.reject", {"account_id": account, "reason": "not now"})

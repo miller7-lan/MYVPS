@@ -183,6 +183,8 @@ class Store:
             ensure_trials(self)
             from .budget import ensure_schema as ensure_budget
             ensure_budget(self)
+            from .provider_sync import ensure_schema as ensure_provider_sync
+            ensure_provider_sync(self)
             self.conn.commit()
         except BaseException:
             self.conn.rollback()

@@ -21,6 +21,7 @@ from .production_state import public_origin
 from .store import parse_time, timestamp, utcnow
 
 SESSION_TTL = dt.timedelta(days=7)
+REJECTED_RETENTION = dt.timedelta(hours=72)
 FULL_MESSAGE = "人员已满，稍后再试"
 DECOY = ""  # account_id of a challenge answered for an address that receives no code.
 RESEND_COOLDOWN_SECONDS = 300
@@ -77,6 +78,50 @@ def ensure_schema(store):
 
 def _exists(store):
     return bool(store.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='portal_accounts'").fetchone())
+
+
+def rejected_delete_at(account):
+    if account["status"] != "rejected" or account["proxy_user_id"]:
+        return None
+    try:
+        return parse_time(account["updated_at"]) + REJECTED_RETENTION
+    except (TypeError, ValueError):
+        return None
+
+
+def prune_rejected(store, now):
+    """Expire unallocated applications in the writer transaction; keep user ledgers.
+
+    updated_at is the rejection transition time. Signing in does not change it,
+    and re-rejecting an already rejected application must not extend retention.
+    Historical notification/audit records retain their existing retention policy.
+    """
+    if not _exists(store):
+        return 0
+    rows = store.conn.execute(
+        "SELECT * FROM portal_accounts WHERE status='rejected' AND proxy_user_id IS NULL "
+        "AND julianday(updated_at)<=julianday(?) ORDER BY updated_at,id LIMIT 100",
+        (timestamp(now - REJECTED_RETENTION),)).fetchall()
+    removed = 0
+    for row in rows:
+        account = dict(row)
+        deadline = rejected_delete_at(account)
+        if deadline is None or deadline > now:
+            continue
+        # The SMTP lease is owned by another thread; finish that send first.
+        if store.conn.execute("SELECT 1 FROM portal_mail m JOIN mail_outbox o ON m.outbox_id=o.id "
+                              "WHERE m.account_id=? AND o.status='sending' LIMIT 1", (account["id"],)).fetchone():
+            continue
+        parameters = (account["id"],)
+        outbox = "SELECT outbox_id FROM portal_mail WHERE account_id=?"
+        store.conn.execute("UPDATE mail_outbox SET status='cancelled',completed_at=?,error_code='REGISTRATION_RETENTION_EXPIRED' "
+                           "WHERE status IN ('queued','retry') AND id IN (" + outbox + ")", (timestamp(now), *parameters))
+        store.conn.execute("DELETE FROM mail_private_payload WHERE outbox_id IN (" + outbox + ")", parameters)
+        for table in ("portal_challenges", "portal_sessions", "portal_mail"):
+            store.conn.execute("DELETE FROM " + table + " WHERE account_id=?", parameters)
+        store.conn.execute("DELETE FROM portal_accounts WHERE id=?", parameters)
+        removed += 1
+    return removed
 
 
 def _existing_identity(store, email):
@@ -238,6 +283,7 @@ def _public(store, account, now):
             "used_upload": user["used_upload"] if user else 0, "used_download": user["used_download"] if user else 0,
             "last_error": worker.get("last_error") if worker else None,
             "binding_issue": account.get("binding_issue"),
+            "rejected_delete_at": timestamp(deadline) if (deadline := rejected_delete_at(account)) else None,
             "expires_at": (user.get("authorization_expires_at") or user.get("trial_expires_at") or user.get("expires_at")) if user else None,
             "node_names": ["Dazzle'VPS-VLESS（常用）", "Dazzle'VPS-TUIC5（迅速）"] if user else [],
             "configuration_available": _status(store, account, now) == "active"}
@@ -275,7 +321,7 @@ def snapshot(store, now=None):
             "pending_count": sum(a["status"] in {"pending", "waiting_resources", "needs_confirmation"} for a in accounts),
             "accounts": accounts,
             "pool": {"available": sum(r["user_id"] is None and not r["tombstoned"] for r in slots), "total": len(slots)},
-            "capacity": capacity(store)}
+            "capacity": capacity(store), "rejected_retention_hours": 72}
 
 
 def _links(store, account):
@@ -697,7 +743,10 @@ def pending_token(store, token):
 def handle_admin(store, action, params, now):
     if action == "registration.list":
         return {"registration": snapshot(store, now)}
-    account = _account(store, params.get("account_id"))
+    try:
+        account = _account(store, params.get("account_id"))
+    except PortalError as exc:
+        raise domain.DomainError(exc.code, str(exc)) from None
     if not account["email_verified_at"] or account["status"] == "revoked":
         raise domain.DomainError("VALIDATION", "Only a verified live account can be reviewed")
     if action == "registration.bind":
@@ -712,6 +761,8 @@ def handle_admin(store, action, params, now):
     if action == "registration.reject":
         if account["proxy_user_id"]:
             raise domain.DomainError("VALIDATION", "Use user.disable for an already allocated user")
+        if account["status"] == "rejected":
+            return {"account": _public(store, account, now)}
         reason = params.get("reason", "")
         if reason:
             reason = domain.text(reason, "reason", 200)

@@ -57,6 +57,20 @@ def facts():
 
 
 class RefreshHost(ExpansionHost):
+    def completed_guard_proof(self, identifier, worker):
+        """A sticky startup STATUS needs independent root completion evidence."""
+        from dazzle.meter_guard import GuardError, read_proof
+        try:
+            policy = json.loads(self.read_trusted(self.layout.policy))
+            proof = read_proof(policy, identifier, directory=self.layout.guard_proofs)
+            config = self.read_trusted(self.layout.etc / "workers" / (identifier + ".json"))
+            return bool(proof and proof["phase"] == "complete" and proof["mode"] == "running"
+                        and proof["generation"] == worker["root_ack_generation"]
+                        and proof["process_id"] == worker["process_id"]
+                        and proof["config_sha256"] == sha256(config))
+        except (GuardError, OSError, ValueError, KeyError, TypeError):
+            return False
+
     def ledger(self):
         account = pwd.getpwnam(self.layout.agent_account)
         return RefreshLedgerReader(self.layout.database, user=account.pw_uid, group=account.pw_gid,
@@ -88,7 +102,7 @@ def _definitions(host, units):
     return files
 
 
-def refresh_guard_ready(identifier, observed, worker, user):
+def refresh_guard_ready(identifier, observed, worker, user, host=None):
     if guard_ready(identifier, observed):
         return True
     status = parse_status(observed["status"])
@@ -97,7 +111,15 @@ def refresh_guard_ready(identifier, observed, worker, user):
     # Accept that exact historical label only for a fully settled, enabled,
     # quota-bound trusted row. The callers still verify the original Core and
     # guard identities, bindings, fresh samples, budget and TCP witness.
-    if status.get("phase") == "api-only-transition":
+    historical = status.get("phase") in {
+        "bootstrap-inactive", "api-only", "api-only-origin", "activation-transition", "activation-origin"}
+    verifier = getattr(host, "completed_guard_proof", None)
+    proven = bool(historical and worker and verifier and verifier(identifier, worker))
+    # Other startup labels remain rejected without a root-owned, same-boot
+    # completed running proof pinned to this PID, generation and config digest.
+    # This proof establishes completion, not sample freshness; all existing
+    # stream/identity/age checks in preview, gate and acceptance still apply.
+    if status.get("phase") == "api-only-transition" or proven:
         return bool(worker and user and worker["role"] == user["role"] in {"admin", "member"}
                     and observed["active"] == "active" and observed["sub"] == "running"
                     and status["_"] == "member-guard-ready" and status.get("worker") == identifier
@@ -204,7 +226,7 @@ def build_plan(host, layout, *, new_release_id, plan_id=None, parameters=None, m
         if (observed["active"], observed["sub"]) != ("active", "running") or observed["pid"] != worker["process_id"]:
             _issue(issues, "CORE", "A live Core process differs from its settled ledger binding")
         if (observed["binds_to"] != [value["guard"]] or observed["need_reload"] != "no"
-                or not refresh_guard_ready(identifier, guard, worker, users.get(worker["user_id"]))):
+                or not refresh_guard_ready(identifier, guard, worker, users.get(worker["user_id"]), host)):
             _issue(issues, "GUARD", "Every live worker must remain bound to its existing ready meter guard")
         for problem in worker_problems(worker, users.get(worker["user_id"]), "member", parameters, now, facts["cycle"]):
             _issue(issues, "LEDGER", problem)
@@ -336,7 +358,7 @@ class RefreshCoordinator(Coordinator):
             self.require(self.same_process(self.reviewed["processes"]["workers"][key], core) and core["binds_to"] == [value["guard"]],
                          "An existing Core changed or lost its guard")
             self.require(self.same_process(self.reviewed["processes"]["guards"][key], guard)
-                         and refresh_guard_ready(key, guard, worker, user), "An existing meter guard changed")
+                         and refresh_guard_ready(key, guard, worker, user, self.host), "An existing meter guard changed")
             self.guards[key] = {"pid": guard["pid"], "invocation": guard["invocation"]}
         for value in self.reviewed["dormant"].values():
             current = self.unit(value["unit"])
@@ -441,7 +463,7 @@ class RefreshCoordinator(Coordinator):
             worker = workers.get(key)
             user = users.get(worker["user_id"]) if worker else None
             if (not self.same_process(self.reviewed["processes"]["guards"][key], observed)
-                    or not refresh_guard_ready(key, observed, worker, user)):
+                    or not refresh_guard_ready(key, observed, worker, user, self.host)):
                 preserved = False
                 self.journal["guard_preservation"] = "A live administrator or member guard changed"
         return health, preserved
@@ -455,7 +477,7 @@ class RefreshCoordinator(Coordinator):
             return False
         worker = next((w for w in facts["workers"] if w["worker_id"] == identifier), None)
         user = next((u for u in facts["users"] if worker and u["id"] == worker["user_id"]), None)
-        return refresh_guard_ready(identifier, observed, worker, user)
+        return refresh_guard_ready(identifier, observed, worker, user, self.host)
 
     def resume_portal(self):
         if not self.portal_held:

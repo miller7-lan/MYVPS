@@ -8,9 +8,10 @@ struct RegistrationsPage: View {
     @State private var search = ""
     @State private var pendingOnly = true
     @State private var review: RegistrationReview?
+    @State private var bindingReview: RegistrationBindingReview?
     private var overview: RegistrationOverview { store.registration }
     private var listedAccounts: [RegistrationAccount] {
-        overview.accounts.filter { !pendingOnly || ["pending", "waiting_resources", "provisioning", "failed"].contains($0.status) }
+        overview.accounts.filter { !pendingOnly || $0.requiresReview }
     }
     private var accounts: [RegistrationAccount] {
         listedAccounts.filter { search.isEmpty || $0.email.localizedStandardContains(search) || $0.nickname.localizedStandardContains(search) }
@@ -24,7 +25,7 @@ struct RegistrationsPage: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 14) {
                     MetricCard(title: "等待处理", value: String(overview.pendingCount), note: "已完成邮箱验证", icon: "person.badge.clock")
-                    MetricCard(title: "空闲资源", value: "\(overview.available) / \(overview.total)", note: "已批准的普通用户槽位", icon: "square.stack.3d.up")
+                    MetricCard(title: "可接受新申请", value: String(overview.admissionRemaining), note: overview.admissionFull ? "人员已满，稍后再试" : "待审核申请已预留名额", icon: "square.stack.3d.up")
                     Card {
                         Toggle("接受新注册", isOn: Binding(get: { overview.enabled }, set: { value in
                             Task { await store.perform("settings.update", ["registration_enabled": .bool(value)]) }
@@ -53,6 +54,7 @@ struct RegistrationsPage: View {
                 }
             }
             .sheet(item: $review) { value in RegistrationReviewSheet(store: store, review: value) }
+            .sheet(item: $bindingReview) { value in RegistrationBindingReviewSheet(store: store, review: value) }
             .onChange(of: pendingOnly) { _, _ in selected = nil }
         }
     }
@@ -65,6 +67,8 @@ struct RegistrationsPage: View {
     }
     private var accountList: some View {
         Card {
+            Text("已拒绝申请保留 72 小时，到期自动清理。")
+                .font(.caption2).foregroundStyle(VPSTheme.muted)
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(VPSTheme.muted)
                 TextField("搜索昵称或邮箱", text: $search).textFieldStyle(.plain)
@@ -106,20 +110,49 @@ struct RegistrationsPage: View {
             if let error = account.raw["last_error"].string, !error.isEmpty {
                 NoticeBox(icon: "exclamationmark.triangle", text: "开通未确认，请核对实例状态后处理。", tint: .orange)
             }
-            if account.canApprove && overview.available == 0 {
+            if account.needsBindingConfirmation {
+                NoticeBox(icon: "person.crop.circle.badge.questionmark", text: account.bindingExplanation, tint: .orange)
+                ForEach(Array(account.bindingCandidates.prefix(20))) { candidate in
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(candidate.name).font(.callout.weight(.medium))
+                            Text(candidate.email).font(.caption).textSelection(.enabled)
+                            Text(candidate.explanation).font(.caption2).foregroundStyle(VPSTheme.muted)
+                        }
+                        Spacer()
+                        Button("核对用户") { openUser(candidate.id) }
+                    }.padding(10).background(VPSTheme.accent.opacity(0.04), in: RoundedRectangle(cornerRadius: 9))
+                }
+                if account.bindingCandidates.isEmpty {
+                    Text("尚无可核对的匹配记录。请先在用户管理中核对邮箱并完成验证，再刷新此页。")
+                        .font(.caption).foregroundStyle(VPSTheme.muted)
+                }
+            } else if account.canApprove && overview.available == 0 {
                 NoticeBox(icon: "hourglass", text: "已批准的资源池已用完。申请继续排队，扩容需要另行审批。", tint: .orange)
             } else if account.status == "provisioning" {
                 NoticeBox(icon: "arrow.triangle.2.circlepath", text: "正在准备独立实例和可信计量。订阅暂不返回可用节点。")
             } else if account.canApprove {
                 NoticeBox(icon: "lock", text: "邮箱已绑定，等待你启用。实际开通后，系统将邮件发送两条订阅链接。")
             }
+            if let deadline = account.raw["rejected_delete_at"].string {
+                NoticeBox(icon: "clock", text: "已拒绝 · 将于 " + Display.date(.string(deadline)) + " 自动清理申请记录。")
+            }
+            if account.canApprove && !store.budget.canAllocate {
+                NoticeBox(icon: "lock.shield", text: store.budget.reason, tint: .orange)
+            }
             HStack {
                 if let userID = account.proxyUserID {
                     Button("前往用户管理") { openUser(userID) }.buttonStyle(.borderedProminent)
+                } else if account.needsBindingConfirmation {
+                    Button("确认关联已有用户") {
+                        guard let candidate = account.bindableCandidates.first, account.bindableCandidates.count == 1 else { return }
+                        bindingReview = RegistrationBindingReview(account: account, candidate: candidate, revision: store.snapshot?.revision)
+                    }.buttonStyle(.borderedProminent)
+                        .disabled(account.bindableCandidates.count != 1 || !store.canPerform("registration.bind"))
                 } else {
                     Button("启用") { review = RegistrationReview(account: account, approve: true, revision: store.snapshot?.revision) }
                         .buttonStyle(.borderedProminent)
-                        .disabled(!account.canApprove || overview.available == 0 || !store.canPerform("registration.approve"))
+                        .disabled(!account.canApprove || overview.available == 0 || !store.canPerform("registration.approve") || !store.budget.canAllocate)
                     Button("拒绝", role: .destructive) { review = RegistrationReview(account: account, approve: false, revision: store.snapshot?.revision) }
                         .disabled(!account.canReject || !store.canPerform("registration.reject"))
                 }
@@ -128,6 +161,44 @@ struct RegistrationsPage: View {
             Text("停用、恢复、轮换及撤销在用户管理中完成，保留流量账本。")
                 .font(.caption2).foregroundStyle(VPSTheme.muted)
         }
+    }
+}
+
+private struct RegistrationBindingReview: Identifiable {
+    let id = UUID()
+    let account: RegistrationAccount
+    let candidate: RegistrationBindingCandidate
+    let revision: Int64?
+}
+
+private struct RegistrationBindingReviewSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Bindable var store: AppStore
+    let review: RegistrationBindingReview
+    @State private var confirmed = false
+    @State private var validation: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack { Text("确认邮箱归属").font(.title2.weight(.semibold)); Spacer(); Button("取消") { dismiss() } }
+            ValueRow(name: "门户登录邮箱", value: review.account.email)
+            ValueRow(name: "已有代理用户", value: review.candidate.name)
+            ValueRow(name: "已验证通知邮箱", value: review.candidate.email)
+            NoticeBox(icon: "link", text: "关联后，使用此邮箱登录的人可以查看该用户的原订阅及节点配置。原有凭据、用量和额度保持，不会重复开户、启动实例或发送首次开通邮件。")
+            Toggle("我已核对归属，确认关联此已有用户", isOn: $confirmed)
+            Text("需系统身份确认。状态变化或出现重复邮箱时，服务器会拒绝绑定，请重新核对。")
+                .font(.caption).foregroundStyle(VPSTheme.muted)
+            if let validation { Text(validation).font(.caption).foregroundStyle(.red) }
+            HStack { Spacer(); Button("确认关联") { submit() }.buttonStyle(.borderedProminent)
+                    .disabled(!confirmed || !store.canPerform("registration.bind")) }
+        }.padding(26).frame(width: 540)
+    }
+    private func submit() {
+        do {
+            let parameters = try store.registration.bindParameters(account: review.account, candidateID: review.candidate.id)
+            dismiss()
+            Task { await store.perform("registration.bind", parameters, expectedRevision: review.revision) }
+        } catch { validation = error.localizedDescription }
     }
 }
 
@@ -145,11 +216,10 @@ private struct RegistrationReviewSheet: View {
     @State private var quota = "100"
     @State private var reason = ""
     @State private var validation: String?
-    private var quotaBytes: Int64? { decimalGB(quota) }
-    private var allocated: Int64 { TrafficOverview.sum(store.users.filter { !$0.revoked && $0.role != "admin" }.compactMap(\.allowance)) }
-    private var hasUnlimitedMembers: Bool { store.users.contains { !$0.revoked && $0.role != "admin" && $0.quota == nil } }
+    private var quotaBytes: Int64? { QuotaInput.bytes(quota, minimumGB: 50) }
+    private var allocated: Int64 { TrafficOverview.sum(store.users.filter { !$0.revoked && !$0.sharesAdministratorBudget }.compactMap(\.allowance)) }
+    private var hasUnlimitedMembers: Bool { store.users.contains { !$0.revoked && !$0.sharesAdministratorBudget && $0.quota == nil } }
     private var afterApproval: Int64 { TrafficOverview.sum([allocated, quotaBytes ?? 0]) }
-    private var verifiedTotal: Int64? { store.snapshot.map(TrafficOverview.init(snapshot:))?.providerTotal }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -162,19 +232,19 @@ private struct RegistrationReviewSheet: View {
                 if hasUnlimitedMembers {
                     NoticeBox(icon: "exclamationmark.triangle", text: "已有普通用户不限量，上述有限额度合计不包含他们的实际消耗。", tint: .orange)
                 }
-                if let total = verifiedTotal {
-                    ValueRow(name: "已核实商家套餐", value: Display.bytes(total))
-                    if afterApproval > total { NoticeBox(icon: "exclamationmark.triangle", text: "用户配置额度合计已超出商家套餐，尚未计入管理员预留与安全余量。", tint: .orange) }
-                } else {
-                    NoticeBox(icon: "exclamationmark.triangle", text: "商家实际额度尚未核实，不能确认总量保护。五位新用户各100GB即达到500GB，另有既有用户和管理员用量。", tint: .orange)
+                ValueRow(name: "人工确认套餐预算", value: Display.bytes(store.budget.raw["total_bytes"].int))
+                ValueRow(name: "当前可分配预算", value: Display.bytes(store.budget.available))
+                if quotaBytes.map({ !store.budget.permits($0) }) ?? true {
+                    NoticeBox(icon: "lock.shield", text: quotaBytes == nil ? "普通用户周期额度需为至少50GB的整数。" : store.budget.rejectionReason(for: quotaBytes ?? 0), tint: .orange)
                 }
+                Text("分配同时保留安全余量；商家实时余量未核验。").font(.caption).foregroundStyle(VPSTheme.muted)
                 NoticeBox(icon: "eye", text: "本次使用一个已批准的空闲槽位，生成独立VLESS与TUIC凭据；实例运行且计量可信后，原订阅链接生效。不会新增防火墙规则。")
             } else {
                 TextField("拒绝原因（选填，最多200字）", text: $reason).textFieldStyle(.roundedBorder)
                 NoticeBox(icon: "lock", text: "该申请的订阅继续保持未启用。不会影响其他用户和原代理。", tint: .orange)
             }
             if let validation { Text(validation).font(.caption).foregroundStyle(.red) }
-            HStack { Spacer(); Button(review.approve ? "确认并启用" : "确认拒绝", role: review.approve ? nil : .destructive) { submit() }.buttonStyle(.borderedProminent).disabled(store.busy) }
+            HStack { Spacer(); Button(review.approve ? "确认并启用" : "确认拒绝", role: review.approve ? nil : .destructive) { submit() }.buttonStyle(.borderedProminent).disabled(store.isSubmitting(review.approve ? "registration.approve" : "registration.reject", target: review.account.id) || (review.approve && (quotaBytes.map { !store.budget.permits($0) } ?? true))) }
         }.padding(26).frame(width: 530)
             .onAppear { quota = String(format: "%g", Double(review.account.raw["quota_bytes"].int ?? store.value("settings")["default_quota_bytes"].int ?? 100_000_000_000) / 1e9) }
     }
@@ -183,7 +253,7 @@ private struct RegistrationReviewSheet: View {
             let parameters: [String: JSONValue]
             let action: String
             if review.approve {
-                guard let quotaBytes else { throw ModelError.invalidResponse("请输入有效的周期额度。") }
+                guard let quotaBytes, store.budget.permits(quotaBytes) else { throw ModelError.invalidResponse("请输入至少50GB的整数额度，并确认可分配预算充足。") }
                 parameters = try store.registration.approveParameters(account: review.account, quotaBytes: quotaBytes)
                 action = "registration.approve"
             } else {

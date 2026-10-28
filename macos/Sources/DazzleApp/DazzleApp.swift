@@ -49,10 +49,10 @@ struct MainView: View {
         }.tint(VPSTheme.accent)
             .task {
                 await store.restoreConnection()
-                while !Task.isCancelled {
-                    do { try await Task.sleep(for: .seconds(8)) } catch { break }
-                    if scenePhase == .active { await store.pollManagement() }
-                }
+            }
+            .task(id: scenePhase) {
+                guard scenePhase == .active else { return }
+                await store.runPolling()
             }
             .onChange(of: store.sshHost) { _, _ in store.invalidateServerConnection() }
             .onChange(of: store.sshKeyPath) { _, _ in store.invalidateServerConnection() }
@@ -63,6 +63,9 @@ struct MainView: View {
             .sheet(item: $store.artifact) { artifact in ExportView(store: store, artifact: artifact) }
             .sheet(isPresented: Binding(get: { store.preview != nil }, set: { if !$0 { store.preview = nil } })) {
                 ReviewSheet(value: store.preview ?? .null) { store.preview = nil }
+            }
+            .sheet(isPresented: Binding(get: { store.recoveryPreview != nil }, set: { if !$0 { store.recoveryPreview = nil } })) {
+                UserRecoverySheet(store: store, value: store.recoveryPreview ?? .null)
             }
     }
     private var sidebar: some View {
@@ -88,8 +91,12 @@ struct MainView: View {
             Spacer()
             Label(store.serverReachable ? "已连接" : "未连接", systemImage: "lock.shield")
                 .font(.system(size: 12, weight: .medium)).foregroundStyle(store.serverReachable ? VPSTheme.accent : .secondary)
-            Button { Task { await store.refresh() } } label: { Image(systemName: "arrow.clockwise").frame(width: 22, height: 22) }
-                .buttonStyle(.borderless).help("刷新服务器 ⌘R").disabled(store.busy)
+            Button { Task { await store.refresh() } } label: {
+                Group {
+                    if store.refreshing { ProgressView().controlSize(.small) }
+                    else { Image(systemName: "arrow.clockwise") }
+                }.frame(width: 22, height: 22)
+            }.buttonStyle(.borderless).help(store.refreshing ? "正在更新，上次数据仍可查看和操作" : "刷新服务器 ⌘R").disabled(store.connecting)
         }.padding(.horizontal, 26).padding(.vertical, 18)
     }
     @ViewBuilder private var serverContent: some View {
@@ -97,12 +104,13 @@ struct MainView: View {
             if page == .settings { ConnectionPage(store: store) }
             else {
                 Card {
-                    EmptyState(icon: "server.rack", title: store.busy ? "正在连接服务器" : "连接服务器", detail: "读取服务器上的用户、用量与实例状态。")
-                    Button("设置连接") { page = .settings; settings = .connection }.buttonStyle(.borderedProminent).disabled(store.busy).frame(maxWidth: .infinity)
+                    EmptyState(icon: "server.rack", title: store.connecting ? "正在连接服务器" : "连接服务器", detail: "读取服务器上的用户、用量与实例状态。")
+                    Button("设置连接") { page = .settings; settings = .connection }.buttonStyle(.borderedProminent).disabled(store.connecting).frame(maxWidth: .infinity)
                 }
             }
         } else {
             ManagementStatusCard(store: store)
+            RecoveryProgressBanner(store: store)
             switch page {
             case .dashboard:
                 DashboardPage(store: store, onUsers: { selectedUser = nil; page = .users }, onUser: { id in selectedUser = id; page = .users }, onSettings: { settings = .cycles; page = .settings })
@@ -122,7 +130,8 @@ struct MainView: View {
     }
     private var footer: some View {
         HStack(spacing: 7) {
-            if store.busy { ProgressView().controlSize(.mini); Text("处理中") }
+            if store.connecting { ProgressView().controlSize(.mini); Text("正在连接服务器") }
+            else if let activity = store.activityText { ProgressView().controlSize(.mini); Text(activity).lineLimit(1).help(activity) }
             else if let notice = store.notice {
                 Image(systemName: store.noticeIsWarning ? "exclamationmark.circle" : "checkmark.circle.fill").foregroundStyle(store.noticeIsWarning ? Color.orange : VPSTheme.accent)
                 Text(notice).lineLimit(1).help(notice)
@@ -182,7 +191,8 @@ private struct ReviewSheet: View {
             "Install project systemd service/timers after local validation": "验证后安装本项目后台与定时任务",
             "Configure verified official provider adapter and securely provision credentials": "接入已核实的商家只读 API",
             "Configure real TLS SMTP and explicitly authorize test email": "配置加密邮件提交并批准测试投递",
-            "No official QQG API scope/schema verified": "QQG API 权限与字段尚未核实", "No real SMTP configured": "真实邮件尚未配置", "Native API is not enabled or verified on production": "线上计量接口尚未启用", "New ports not approved": "新端口尚未批准",
+            "No official QQG API scope/schema verified": "QQG API 权限与字段尚未核实",
+            "QQG API key is account-wide; restrict it to the server IP whitelist": "QQG API 密钥没有只读权限，须设置服务器 IP 白名单", "No real SMTP configured": "真实邮件尚未配置", "Native API is not enabled or verified on production": "线上计量接口尚未启用", "New ports not approved": "新端口尚未批准",
             "Stop NEW project workers and agent only": "仅停止本项目新增的实例和后台", "Keep legacy443 untouched": "保留既有 443 入口",
             "Never roll back ledger counters, mail idempotency or completed cycles": "保留流量账本、通知去重与已处理周期",
             "Never overwrite current valid TLS certificate with an older backup": "保留当前有效证书"
